@@ -1,6 +1,0 @@
-streamlit
-pypdf
-python-docx
-scikit-learn
-numpy
-reportlab
