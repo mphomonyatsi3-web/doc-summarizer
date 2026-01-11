@@ -1,745 +1,540 @@
 import re
-import html
-from io import BytesIO
-from typing import List, Tuple, Dict
-from difflib import SequenceMatcher
+import io
+import time
+import json
+import hashlib
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Optional
 
 import numpy as np
 import streamlit as st
 from pypdf import PdfReader
 from docx import Document as DocxDocument
-
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
-
-# Export
-from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib.units import cm
 
 
-# -----------------------------
+# =========================
 # App Config
-# -----------------------------
+# =========================
 st.set_page_config(page_title="Document Summarizer", page_icon="📄", layout="wide")
-
-APP_TITLE = "📄 Clarity Summarizer"
-APP_TAGLINE = "Pick who you are → the app adapts the summary, highlights, and questions."
-
-HARD_MAX_UPLOAD_MB = 300
-
-# Char caps keep processing fast/stable (esp. Streamlit Cloud)
-CHAR_LIMIT_OWNER = 450_000
-CHAR_LIMIT_PAID = 250_000
-CHAR_LIMIT_FREE = 180_000
-
-PAGES_OWNER = 500
-PAGES_PAID = 250
-PAGES_FREE = 150
-
-FREE_MAX_DOCS = 2
-PAID_MAX_DOCS = 10
-OWNER_MAX_DOCS = 10_000
+APP_VERSION = "v2.5 (Section-only PDF Processing ✅)"
 
 
-# -----------------------------
-# Secrets / PIN / Tier
-# -----------------------------
-def _get_secret(key: str) -> str:
-    try:
-        return str(st.secrets.get(key, "")).strip()
-    except Exception:
-        return ""
+# =========================
+# Limits / Tiers
+# =========================
+@dataclass
+class Tier:
+    name: str
+    max_docs: int
+    max_pages: int
+    max_file_mb: int
 
-OWNER_PIN = _get_secret("OWNER_PIN")
-TRIAL_PIN = _get_secret("TRIAL_PIN")
-PAID_PIN = _get_secret("PAID_PIN")
-
-
-def compute_tier(pin: str) -> str:
-    pin = (pin or "").strip()
-    if OWNER_PIN and pin == OWNER_PIN:
-        return "owner"
-    if PAID_PIN and pin == PAID_PIN:
-        return "paid"
-    if TRIAL_PIN and pin == TRIAL_PIN:
-        return "free"
-    return "none"
+FREE_TIER = Tier("Free", max_docs=2, max_pages=150, max_file_mb=300)
+PAID_TIER = Tier("Paid", max_docs=10, max_pages=200, max_file_mb=300)
+OWNER_TIER = Tier("Owner", max_docs=50, max_pages=9999, max_file_mb=300)
 
 
-def limits_for_tier(tier: str) -> Dict[str, int]:
-    if tier == "owner":
-        return {"max_docs": OWNER_MAX_DOCS, "max_pages": PAGES_OWNER, "char_limit": CHAR_LIMIT_OWNER, "max_mb": HARD_MAX_UPLOAD_MB}
-    if tier == "paid":
-        return {"max_docs": PAID_MAX_DOCS, "max_pages": PAGES_PAID, "char_limit": CHAR_LIMIT_PAID, "max_mb": HARD_MAX_UPLOAD_MB}
-    if tier == "free":
-        return {"max_docs": FREE_MAX_DOCS, "max_pages": PAGES_FREE, "char_limit": CHAR_LIMIT_FREE, "max_mb": HARD_MAX_UPLOAD_MB}
-    return {"max_docs": 0, "max_pages": 0, "char_limit": 0, "max_mb": 0}
+# =========================
+# Text cleanup
+# =========================
+def fix_spaced_letters(text: str) -> str:
+    if not text:
+        return text
+
+    def _join(match):
+        return match.group(0).replace(" ", "")
+
+    # Fix "p s y c h o l o g y" -> "psychology"
+    text = re.sub(r'(?<!\w)(?:[A-Za-z]\s){2,}[A-Za-z](?!\w)', _join, text)
+    # Fix hyphen line breaks: "exam-\nple" -> "example"
+    text = re.sub(r'(\w)-\s*\n\s*(\w)', r'\1\2', text)
+    # Collapse spaces
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
-def auth_gate():
-    st.sidebar.subheader("🔐 Access")
-    if not (OWNER_PIN or TRIAL_PIN or PAID_PIN):
-        st.warning("No PINs configured. Add OWNER_PIN / TRIAL_PIN / PAID_PIN in Streamlit Secrets.")
-        st.stop()
-
-    if "tier" not in st.session_state:
-        st.session_state.tier = "none"
-    if "docs_used" not in st.session_state:
-        st.session_state.docs_used = 0
-
-    pin = st.sidebar.text_input("Enter PIN", type="password", placeholder="••••••")
-    tier = compute_tier(pin)
-    st.session_state.tier = tier
-
-    if tier == "none":
-        st.sidebar.error("No access. Enter a valid PIN.")
-        st.stop()
-
-    lim = limits_for_tier(tier)
-    st.sidebar.success(f"Access: {tier.upper()}")
-    st.sidebar.caption(f"Docs this session: {st.session_state.docs_used}/{lim['max_docs']}")
-    if st.session_state.docs_used >= lim["max_docs"]:
-        st.error("Document limit reached for this session.")
-        st.stop()
-
-    return lim, tier
-
-
-# -----------------------------
-# Fast text utilities (no NLTK)
-# -----------------------------
 def normalize_text(s: str) -> str:
+    if not s:
+        return ""
     s = s.replace("\r", "\n")
     s = re.sub(r"[ \t]{2,}", " ", s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
+    s = re.sub(r"\n{3,}", "\n\n", s).strip()
+    s = fix_spaced_letters(s)
+    return s
 
 
-def split_sentences_fast(text: str) -> List[str]:
-    text = normalize_text(text)
+def remove_toc_noise(text: str) -> str:
+    lines = text.splitlines()
+    cleaned = []
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            continue
+        if re.search(r"\.{3,}", s):  # "....."
+            continue
+        if len(re.findall(r"\d", s)) >= 7 and len(s) <= 90:
+            continue
+        cleaned.append(ln)
+    return "\n".join(cleaned).strip()
+
+
+def sentence_split(text: str) -> List[str]:
+    text = re.sub(r"\s+", " ", text).strip()
     if not text:
         return []
-    t = re.sub(r"\s*\n\s*", " ", text)
-    parts = re.split(r'(?<=[\.\!\?\;])\s+(?=[A-Z0-9"\'])', t)
-    parts = [p.strip() for p in parts if p.strip()]
-    if len(parts) < 3 and len(t) > 1200:
-        chunk = 350
-        parts = [t[i:i+chunk].strip() for i in range(0, len(t), chunk)]
-    return parts
+    parts = re.split(r'(?<=[.!?])\s+(?=[A-Z0-9"“‘])', text)
+    return [p.strip() for p in parts if p.strip()]
 
 
-def tokenize_words(text: str) -> List[str]:
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9\s\-']", " ", text)
-    words = [w for w in text.split() if len(w) >= 3 and w not in ENGLISH_STOP_WORDS]
-    return words
+def safe_hash_bytes(b: bytes) -> str:
+    h = hashlib.sha256()
+    chunk = 1024 * 1024
+    for i in range(0, len(b), chunk):
+        h.update(b[i:i+chunk])
+    return h.hexdigest()
 
 
-# -----------------------------
-# Cached extraction
-# -----------------------------
+# =========================
+# Headings detection (for section-only mode)
+# =========================
+HEADING_PATTERNS = [
+    r'^\s*chapter\s+\d+\b.*$',           # Chapter 1 ...
+    r'^\s*\d+(\.\d+)*\s+[A-Z].*$',       # 1.2 Title
+    r'^\s*[A-Z][A-Z0-9\s:,-]{6,}$',      # ALL CAPS headings
+]
+
+def looks_like_heading(line: str) -> bool:
+    s = line.strip()
+    if len(s) < 6 or len(s) > 120:
+        return False
+    for pat in HEADING_PATTERNS:
+        if re.match(pat, s, flags=re.IGNORECASE):
+            return True
+    return False
+
+
 @st.cache_data(show_spinner=False)
-def extract_pdf_text_cached(file_bytes: bytes, max_pages: int, char_limit: int) -> Tuple[str, int]:
-    reader = PdfReader(BytesIO(file_bytes))
+def scan_pdf_headings(file_id: str, file_bytes: bytes, scan_pages: int) -> List[Tuple[str, int]]:
+    """
+    Fast scan: reads only first scan_pages to find headings.
+    Returns list of (heading_title, page_index0).
+    """
+    reader = PdfReader(io.BytesIO(file_bytes))
     total_pages = len(reader.pages)
-    limit_pages = min(total_pages, max_pages)
+    scan_pages = min(scan_pages, total_pages)
 
-    out = []
-    collected = 0
-    pages_done = 0
+    headings: List[Tuple[str, int]] = []
+    seen = set()
 
-    for i in range(limit_pages):
+    for i in range(scan_pages):
         try:
             page_text = reader.pages[i].extract_text() or ""
         except Exception:
             page_text = ""
-        if page_text:
-            out.append(page_text)
-            collected += len(page_text)
-        pages_done = i + 1
-        if collected >= char_limit:
+
+        page_text = normalize_text(page_text)
+        for ln in page_text.splitlines():
+            t = ln.strip()
+            if not t:
+                continue
+            if looks_like_heading(t):
+                key = re.sub(r"\s+", " ", t).lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                headings.append((t, i))
+        # small optimization: if we already found many headings early, stop
+        if len(headings) >= 35:
             break
 
-    return normalize_text("\n".join(out)), pages_done
+    # If nothing found, fallback "Whole Document"
+    if not headings:
+        return [("Whole Document (no headings detected)", 0)]
+
+    # Ensure the very start exists as an option
+    if headings[0][1] > 0:
+        headings.insert(0, ("Start (before first heading)", 0))
+
+    return headings
 
 
-@st.cache_data(show_spinner=False)
-def extract_docx_text_cached(file_bytes: bytes, char_limit: int) -> str:
-    doc = DocxDocument(BytesIO(file_bytes))
-    chunks = []
-    collected = 0
-    for p in doc.paragraphs:
-        tx = (p.text or "").strip()
-        if tx:
-            chunks.append(tx)
-            collected += len(tx)
-            if collected >= char_limit:
-                break
-    return normalize_text("\n".join(chunks))
+def compute_heading_ranges(headings: List[Tuple[str, int]], total_pages: int) -> List[Tuple[str, int, int]]:
+    """
+    Converts (title, start_page0) into (title, start_page1, end_page1)
+    end_page1 is inclusive.
+    """
+    ranges = []
+    for idx, (title, start0) in enumerate(headings):
+        start1 = start0 + 1
+        if idx + 1 < len(headings):
+            next_start0 = headings[idx + 1][1]
+            end1 = max(start1, next_start0)  # end at page before next heading start
+        else:
+            end1 = total_pages
+        # end1 should be inclusive; if next heading starts at same page, keep end=start
+        end1 = max(start1, end1)
+        ranges.append((title, start1, end1))
+    return ranges
 
 
-@st.cache_data(show_spinner=False)
-def extract_txt_cached(file_bytes: bytes, char_limit: int) -> str:
-    try:
-        text = file_bytes.decode("utf-8", errors="ignore")
-    except Exception:
-        text = file_bytes.decode(errors="ignore")
-    return normalize_text(text[:char_limit])
+# =========================
+# PDF extraction with page-range support (SECTION-ONLY ✅)
+# =========================
+def extract_pdf_text_range(file_bytes: bytes, start_page1: int, end_page1: int, progress_cb=None) -> Tuple[str, int]:
+    reader = PdfReader(io.BytesIO(file_bytes))
+    total_pages = len(reader.pages)
 
+    start0 = max(0, start_page1 - 1)
+    end0 = min(total_pages - 1, end_page1 - 1)
+    pages_to_read = max(0, end0 - start0 + 1)
 
-def looks_scanned_or_empty(text: str) -> bool:
-    return len(text.strip()) < 300
-
-
-# -----------------------------
-# Summarization (TextRank-ish) + concept mining
-# -----------------------------
-def textrank_summary(sentences: List[str], top_n: int = 6) -> List[str]:
-    if not sentences:
-        return []
-    if len(sentences) <= top_n:
-        return sentences
-
-    vectorizer = TfidfVectorizer(stop_words="english")
-    X = vectorizer.fit_transform(sentences)
-
-    sim = cosine_similarity(X)
-    np.fill_diagonal(sim, 0)
-
-    scores = np.ones(len(sentences))
-    damping = 0.85
-    for _ in range(20):
-        prev = scores.copy()
-        row_sums = sim.sum(axis=1)
-        norm_sim = np.divide(sim, row_sums[:, None] + 1e-12)
-        scores = (1 - damping) + damping * norm_sim.T.dot(prev)
-        if np.abs(scores - prev).sum() < 1e-6:
-            break
-
-    idx = np.argsort(scores)[::-1][:top_n]
-    idx_sorted = sorted(idx.tolist())
-    return [sentences[i] for i in idx_sorted]
-
-
-def tfidf_keywords(text: str, k: int = 12) -> List[str]:
-    words = tokenize_words(text)
-    if not words:
-        return []
-    doc = " ".join(words)
-    vec = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=6000)
-    X = vec.fit_transform([doc])
-    feats = np.array(vec.get_feature_names_out())
-    scores = X.toarray().ravel()
-    if scores.size == 0:
-        return []
-    top_idx = np.argsort(scores)[::-1]
-    kws = []
-    seen = set()
-    for i in top_idx:
-        term = feats[i].strip()
-        if not term or term in seen:
-            continue
-        if term in ("chapter", "page", "section"):
-            continue
-        seen.add(term)
-        kws.append(term)
-        if len(kws) >= k:
-            break
-    return kws
-
-
-def pick_sentences_by_pattern(sentences: List[str], patterns: List[str], cap: int) -> List[str]:
     out = []
-    rx_list = [re.compile(p, flags=re.IGNORECASE) for p in patterns]
-    for s in sentences:
-        if any(rx.search(s) for rx in rx_list):
-            out.append(s.strip())
-            if len(out) >= cap:
-                break
-    return out
+    for j, i in enumerate(range(start0, end0 + 1), start=1):
+        try:
+            page_text = reader.pages[i].extract_text() or ""
+        except Exception:
+            page_text = ""
+        out.append(page_text)
+        if progress_cb:
+            progress_cb(j, pages_to_read)
+
+    text = "\n".join(out)
+    return normalize_text(remove_toc_noise(text)), pages_to_read
 
 
-def concept_sentences(sentences: List[str]) -> Dict[str, List[str]]:
-    """
-    Detect sentence roles (definitions, rules, risks, examples, cause/effect).
-    """
-    defs = pick_sentences_by_pattern(sentences, [r"\bis\b", r"\bmeans\b", r"\brefers to\b", r"\bdefined as\b"], 12)
-    rules = pick_sentences_by_pattern(sentences, [r"\bmust\b", r"\bshould\b", r"\brequired\b", r"\balways\b", r"\bnever\b"], 12)
-    risks = pick_sentences_by_pattern(sentences, [r"\bavoid\b", r"\brisk\b", r"\bwarning\b", r"\bfailure\b", r"\bloss\b", r"\bleads to\b", r"\bresults in\b"], 12)
-    examples = pick_sentences_by_pattern(sentences, [r"\bfor example\b", r"\bsuch as\b", r"\be\.g\.\b"], 12)
-    cause = pick_sentences_by_pattern(sentences, [r"\bbecause\b", r"\btherefore\b", r"\bhence\b", r"\bas a result\b"], 12)
-    return {"definitions": defs, "rules": rules, "risks": risks, "examples": examples, "cause_effect": cause}
+def extract_docx_text(file_bytes: bytes) -> str:
+    doc = DocxDocument(io.BytesIO(file_bytes))
+    paras = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
+    return normalize_text("\n".join(paras))
 
 
-# -----------------------------
-# Non-repeating, harder question engine
-# -----------------------------
-def _norm_q(q: str) -> str:
-    q = q.lower().strip()
-    q = re.sub(r"\s+", " ", q)
-    q = re.sub(r"[^a-z0-9\s]", "", q)
-    return q
-
-
-def dedupe_questions(questions: List[str], similarity_threshold: float = 0.90) -> List[str]:
-    """
-    Removes exact duplicates and near-duplicates (very similar questions).
-    """
-    kept = []
-    kept_norm = []
-    for q in questions:
-        q2 = q.strip()
-        if not q2:
-            continue
-        n = _norm_q(q2)
-        if not n:
-            continue
-        # exact dup
-        if n in kept_norm:
-            continue
-        # near-dup
-        is_near = False
-        for existing in kept:
-            ratio = SequenceMatcher(None, _norm_q(existing), n).ratio()
-            if ratio >= similarity_threshold:
-                is_near = True
-                break
-        if is_near:
-            continue
-
-        kept.append(q2)
-        kept_norm.append(n)
-    return kept
-
-
-def build_advanced_questions(
-    persona: str,
-    summary_sents: List[str],
-    keywords: List[str],
-    concepts: Dict[str, List[str]],
-    n: int
-) -> List[str]:
-    """
-    Persona-aware question generator that produces variety and avoids repeats.
-    """
-    # Pick “concept anchors”
-    kws = keywords[: min(10, len(keywords))]
-    defs = concepts.get("definitions", [])
-    rules = concepts.get("rules", [])
-    risks = concepts.get("risks", [])
-    cause = concepts.get("cause_effect", [])
-
-    def pick_anchor_text(lst: List[str], fallback: List[str]) -> str:
-        if lst:
-            return lst[0]
-        if fallback:
-            return fallback[0]
+def extract_txt_text(file_bytes: bytes) -> str:
+    try:
+        return normalize_text(file_bytes.decode("utf-8", errors="ignore"))
+    except Exception:
         return ""
 
-    anchor_def = pick_anchor_text(defs, summary_sents)
-    anchor_rule = pick_anchor_text(rules, summary_sents)
-    anchor_risk = pick_anchor_text(risks, summary_sents)
-    anchor_cause = pick_anchor_text(cause, summary_sents)
 
-    out = []
-
-    # --- Persona templates ---
-    if persona == "Varsity student":
-        # Harder: application, evaluation, comparison, scenario, critical thinking
-        if anchor_def:
-            out.append(f"Explain the concept in your own words: “{anchor_def}”")
-        if anchor_cause:
-            out.append(f"Explain the cause-and-effect relationship stated here: “{anchor_cause}”")
-        if anchor_rule:
-            out.append(f"State the rule clearly, then justify *why* it should be followed: “{anchor_rule}”")
-        if anchor_risk:
-            out.append(f"Identify the risk and propose a mitigation strategy: “{anchor_risk}”")
-
-        # Application + scenario
-        for kw in kws[:4]:
-            out.append(f"Apply **{kw}** to a realistic scenario *not mentioned* in the document. Show steps and reasoning.")
-        # Evaluation
-        for kw in kws[4:6]:
-            out.append(f"Critically evaluate **{kw}**: assumptions, limitations, and when it might fail.")
-        # Comparison: pick two keywords if possible
-        if len(kws) >= 2:
-            out.append(f"Compare **{kws[0]}** vs **{kws[1]}**. Give similarities, differences, and when to use each.")
-
-    elif persona == "High school learner":
-        # Explain + connect + light application
-        if anchor_def:
-            out.append(f"Define this in simple terms, then give an example: “{anchor_def}”")
-        if anchor_cause:
-            out.append(f"Explain why this happens: “{anchor_cause}”")
-        if anchor_rule:
-            out.append(f"What does this rule mean in practice? “{anchor_rule}”")
-
-        for kw in kws[:6]:
-            out.append(f"Explain **{kw}** and give one example from real life or schoolwork.")
-        out.append("Summarize the main idea in 5 bullet points without copying sentences.")
-
-    elif persona == "Primary school learner":
-        # Very simple comprehension questions
-        if anchor_def:
-            out.append(f"What does this mean? “{anchor_def}”")
-        for kw in kws[:5]:
-            out.append(f"What is **{kw}**? Explain like I’m 10 years old.")
-        out.append("Tell the story of the document in 5 short sentences.")
-
-    elif persona == "Trader":
-        # Convert doc into rules, scenarios, mistakes, checklist
-        out.append("Turn this document into a clear trading checklist (before entry, entry, management, exit).")
-        if anchor_rule:
-            out.append(f"Convert this rule into a strict checklist item + an example: “{anchor_rule}”")
-        if anchor_risk:
-            out.append(f"What mistake is being warned about here, and how do you prevent it? “{anchor_risk}”")
-        for kw in kws[:6]:
-            out.append(f"Using **{kw}**, create a scenario: conditions → entry trigger → invalidation → risk management → exit.")
-        out.append("List 5 common failure points from this strategy and how to avoid each one.")
-
-    elif persona == "Professional / Work":
-        # Decision + action items + risks
-        out.append("Extract 10 action items from this document (as tasks someone can execute).")
-        if anchor_rule:
-            out.append(f"Rewrite this requirement as a policy statement + compliance checklist: “{anchor_rule}”")
-        if anchor_risk:
-            out.append(f"Identify the risk here and propose controls/mitigation: “{anchor_risk}”")
-        for kw in kws[:6]:
-            out.append(f"What is the business impact of **{kw}**? Include risks and opportunities.")
-        out.append("Write a 1-paragraph executive summary + 5 bullet recommendations.")
-
-    else:  # default: "General"
-        if anchor_def:
-            out.append(f"Explain clearly: “{anchor_def}”")
-        for kw in kws[:8]:
-            out.append(f"Explain **{kw}** and why it matters.")
-        out.append("What are the 5 most important takeaways and why?")
-
-    # Add a few summary-sentence questions (variety)
-    for s in summary_sents[: min(6, len(summary_sents))]:
-        s2 = re.sub(r"\s+", " ", s).strip()
-        if len(s2) > 35:
-            out.append(f"What is the main claim in this sentence, and what evidence would support it? “{s2[:180]}...”")
-
-    # Deduplicate strongly so user doesn't see repeats
-    out = dedupe_questions(out, similarity_threshold=0.90)
-
-    # Cap to requested number
-    return out[:n]
+# =========================
+# Summaries / Keywords
+# =========================
+def extract_keywords(text: str, top_k: int = 12) -> List[str]:
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) < 60:
+        return []
+    try:
+        vec = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=6000)
+        X = vec.fit_transform([text])
+        feats = np.array(vec.get_feature_names_out())
+        scores = X.toarray().flatten()
+        idx = np.argsort(scores)[::-1][:top_k]
+        kws = [feats[i] for i in idx if scores[i] > 0]
+        # unique
+        seen = set()
+        out = []
+        for k in kws:
+            k2 = k.lower().strip()
+            if k2 in seen:
+                continue
+            seen.add(k2)
+            out.append(k.strip())
+        return out
+    except Exception:
+        return []
 
 
-# -----------------------------
-# Concept-based highlights (colored spans)
-# -----------------------------
-def highlight_concepts(text: str, concepts: Dict[str, List[str]], max_len: int = 90_000) -> str:
-    """
-    Highlights concept patterns, not just keywords.
-    Color meaning:
-      Blue = definitions, Orange = rules, Red = risks, Green = examples, Purple = cause/effect
-    """
-    t = (text or "")[:max_len]
-    esc = html.escape(t)
+def summarize_sentences(text: str, n_sent: int = 6) -> List[str]:
+    sents = sentence_split(text)
+    if not sents:
+        return []
+    try:
+        vec = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=9000)
+        X = vec.fit_transform(sents)
+        scores = np.asarray(X.sum(axis=1)).ravel()
+        top_idx = np.argsort(scores)[::-1][:min(n_sent, len(sents))]
+        top_idx_sorted = sorted(top_idx)
+        return [sents[i] for i in top_idx_sorted]
+    except Exception:
+        return sents[:n_sent]
 
-    # Regex patterns (concept roles)
-    patterns = [
-        (r"\b(is|means|refers to|defined as)\b", "#dbeafe"),      # definitions (blue-ish)
-        (r"\b(must|should|required|always|never)\b", "#ffedd5"),  # rules (orange-ish)
-        (r"\b(avoid|risk|warning|failure|loss|leads to|results in)\b", "#fee2e2"),  # risks (red-ish)
-        (r"\b(for example|such as|e\.g\.)\b", "#dcfce7"),         # examples (green-ish)
-        (r"\b(because|therefore|hence|as a result)\b", "#f3e8ff") # cause/effect (purple-ish)
-    ]
 
-    # Wrap matches
-    for rx, color in patterns:
-        esc = re.sub(
-            rx,
-            lambda m: f'<span style="background:{color}; padding:0 4px; border-radius:6px;">{m.group(0)}</span>',
-            esc,
-            flags=re.IGNORECASE
+def highlight_html(text: str, keywords: List[str]) -> str:
+    if not text:
+        return ""
+    safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    keywords = sorted([k.strip() for k in keywords if k.strip()], key=lambda x: len(x), reverse=True)
+    if not keywords:
+        return f"<div style='white-space:pre-wrap; line-height:1.6'>{safe}</div>"
+    for kw in keywords:
+        pat = re.compile(rf"(?i)\b({re.escape(kw)})\b")
+        safe = pat.sub(r"<mark>\1</mark>", safe)
+    return f"<div style='white-space:pre-wrap; line-height:1.6'>{safe}</div>"
+
+
+# =========================
+# Access / PIN logic
+# =========================
+def resolve_tier(pin_owner: str, pin_paid: str, pin_trial: str) -> Tuple[Tier, str]:
+    secrets = st.secrets if hasattr(st, "secrets") else {}
+    OWNER = secrets.get("OWNER_PIN", "")
+    PAID = secrets.get("PAID_PIN", "")
+    TRIAL = secrets.get("TRIAL_PIN", "")
+
+    if OWNER and pin_owner and pin_owner == OWNER:
+        return OWNER_TIER, "Owner"
+    if (PAID and pin_paid and pin_paid == PAID) or (TRIAL and pin_trial and pin_trial == TRIAL):
+        return PAID_TIER, "Paid"
+    return FREE_TIER, "Free"
+
+
+# =========================
+# Session state
+# =========================
+def init_state():
+    if "history" not in st.session_state:
+        st.session_state.history = []
+    if "last_result" not in st.session_state:
+        st.session_state.last_result = None
+    if "access" not in st.session_state:
+        st.session_state.access = {"tier": FREE_TIER, "mode": "Free"}
+
+init_state()
+
+
+# =========================
+# Sidebar
+# =========================
+st.sidebar.title("⚙️ Settings")
+st.sidebar.caption(APP_VERSION)
+
+owner_pin = st.sidebar.text_input("Owner PIN (optional)", type="password")
+paid_pin = st.sidebar.text_input("Paid PIN (optional)", type="password")
+trial_pin = st.sidebar.text_input("Trial PIN (optional)", type="password")
+
+tier, mode = resolve_tier(owner_pin, paid_pin, trial_pin)
+st.session_state.access = {"tier": tier, "mode": mode}
+
+st.sidebar.success(f"Access: {mode} • Max docs: {tier.max_docs} • Max pages: {tier.max_pages} • Max file: {tier.max_file_mb}MB")
+
+summary_sentences = st.sidebar.slider("Summary length (sentences)", 3, 12, 6)
+keyword_count = st.sidebar.slider("Keywords to highlight", 5, 30, 12)
+
+
+# =========================
+# Main
+# =========================
+st.title("📄 Document Summarizer")
+st.caption("Fast • No NLTK • Now supports Section-only processing for PDFs ✅")
+
+tabs = st.tabs(["✅ Process", "🕘 History"])
+
+with tabs[0]:
+    st.subheader("Upload & Process")
+    st.write("Upload PDF / DOCX / TXT.")
+
+    uploaded = st.file_uploader(
+        f"Upload up to {tier.max_docs} document(s)",
+        type=["pdf", "docx", "txt"],
+        accept_multiple_files=True
+    )
+
+    # SECTION-ONLY MODE UI:
+    section_only = False
+    scan_pages = 30
+    selected_range = None  # (title, start1, end1)
+
+    if uploaded and len(uploaded) == 1:
+        f = uploaded[0]
+        if f.name.lower().endswith(".pdf") or ("pdf" in (f.type or "").lower()):
+            st.markdown("### ⚡ Section-only PDF processing (recommended for big books)")
+            section_only = st.checkbox("Enable Section-only processing (scan headings first)", value=True)
+            scan_pages = st.slider("How many pages to scan for headings (fast)", 5, 80, 30)
+
+            if section_only:
+                file_bytes = f.getvalue()
+                size_mb = len(file_bytes) / (1024 * 1024)
+                if size_mb > tier.max_file_mb:
+                    st.error(f"File too large: {size_mb:.1f}MB. Limit is {tier.max_file_mb}MB.")
+                    st.stop()
+
+                file_id = safe_hash_bytes(file_bytes)
+                reader = PdfReader(io.BytesIO(file_bytes))
+                total_pages = len(reader.pages)
+
+                with st.spinner("Scanning headings…"):
+                    headings = scan_pdf_headings(file_id, file_bytes, scan_pages)
+                ranges = compute_heading_ranges(headings, total_pages)
+
+                labels = [f"{t}  (pages {s}-{e})" for (t, s, e) in ranges]
+                pick = st.selectbox("Choose the section to process", labels)
+                selected_range = ranges[labels.index(pick)]
+
+                st.info("✅ This will extract ONLY the selected page range, not the full PDF.")
+
+    if uploaded:
+        if len(uploaded) > tier.max_docs:
+            st.error(f"Too many files. Your limit is {tier.max_docs}.")
+            st.stop()
+
+        if st.button("⚡ Process Now"):
+            results = []
+            for f in uploaded:
+                file_bytes = f.getvalue()
+                size_mb = len(file_bytes) / (1024 * 1024)
+
+                if size_mb > tier.max_file_mb:
+                    st.error(f"{f.name}: File too large ({size_mb:.1f}MB). Limit {tier.max_file_mb}MB.")
+                    continue
+
+                st.info(f"Processing: {f.name}")
+
+                progress = st.progress(0, text="Preparing...")
+                status = st.empty()
+
+                def prog(done, total):
+                    pct = int((done / max(total, 1)) * 100)
+                    progress.progress(pct, text=f"Extracting… {done}/{total}")
+                    status.info(f"Reading page {done} of {total}")
+
+                try:
+                    name = f.name.lower()
+                    mime = (f.type or "").lower()
+                    file_id = safe_hash_bytes(file_bytes)
+
+                    # PDF section-only extraction
+                    if (name.endswith(".pdf") or "pdf" in mime) and section_only and selected_range is not None:
+                        title, start1, end1 = selected_range
+                        # enforce tier page limit
+                        span = end1 - start1 + 1
+                        if span > tier.max_pages:
+                            end1 = start1 + tier.max_pages - 1
+                            st.warning(f"Section was long. Limited to {tier.max_pages} pages: {start1}-{end1}")
+
+                        status.info(f"Extracting selected section pages {start1}-{end1}…")
+                        text, pages_read = extract_pdf_text_range(file_bytes, start1, end1, progress_cb=prog)
+                        doc_meta = {"id": file_id, "name": f.name, "type": "pdf", "pages": pages_read, "size_mb": size_mb, "section": title, "range": (start1, end1)}
+
+                    # Normal PDF (full up to max_pages)
+                    elif name.endswith(".pdf") or "pdf" in mime:
+                        reader = PdfReader(io.BytesIO(file_bytes))
+                        total_pages = len(reader.pages)
+                        pages_to_read = min(total_pages, tier.max_pages)
+
+                        out = []
+                        for i in range(pages_to_read):
+                            try:
+                                page_text = reader.pages[i].extract_text() or ""
+                            except Exception:
+                                page_text = ""
+                            out.append(page_text)
+                            prog(i + 1, pages_to_read)
+
+                        text = normalize_text(remove_toc_noise("\n".join(out)))
+                        pages_read = pages_to_read
+                        doc_meta = {"id": file_id, "name": f.name, "type": "pdf", "pages": pages_read, "size_mb": size_mb}
+
+                    # DOCX
+                    elif name.endswith(".docx") or "word" in mime:
+                        progress.progress(30, text="Reading DOCX…")
+                        text = extract_docx_text(file_bytes)
+                        progress.progress(100, text="Done.")
+                        doc_meta = {"id": file_id, "name": f.name, "type": "docx", "pages": None, "size_mb": size_mb}
+
+                    # TXT
+                    elif name.endswith(".txt") or "text" in mime:
+                        progress.progress(30, text="Reading TXT…")
+                        text = extract_txt_text(file_bytes)
+                        progress.progress(100, text="Done.")
+                        doc_meta = {"id": file_id, "name": f.name, "type": "txt", "pages": None, "size_mb": size_mb}
+
+                    else:
+                        raise ValueError("Unsupported file type.")
+
+                    progress.progress(100, text="Analyzing…")
+                    if not text or len(text) < 60:
+                        raise ValueError("No readable text found. This may be a scanned PDF (image-based).")
+
+                    kws = extract_keywords(text, top_k=keyword_count)
+                    summary = summarize_sentences(text, n_sent=summary_sentences)
+
+                    result = {
+                        "doc": doc_meta,
+                        "text": text,
+                        "keywords": kws,
+                        "summary": summary,
+                        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                    results.append(result)
+
+                    status.success("Done ✅")
+
+                except Exception as e:
+                    st.error(f"Failed on {f.name}: {e}")
+
+            if results:
+                st.session_state.last_result = results
+                for r in results:
+                    st.session_state.history.insert(0, {
+                        "name": r["doc"]["name"],
+                        "created_at": r["created_at"],
+                        "summary": r["summary"],
+                        "keywords": r["keywords"],
+                        "size_mb": r["doc"]["size_mb"],
+                        "pages": r["doc"]["pages"],
+                        "section": r["doc"].get("section"),
+                        "range": r["doc"].get("range"),
+                    })
+
+    # Show last results
+    last = st.session_state.last_result
+    if last:
+        st.divider()
+        st.subheader("Results")
+        for r in last:
+            doc = r["doc"]
+            st.markdown(f"### {doc['name']}")
+            extra = ""
+            if doc.get("section"):
+                extra = f" • Section: **{doc['section']}** • Pages: {doc.get('range')[0]}-{doc.get('range')[1]}"
+            st.caption(f"Type: {doc['type']} • Size: {doc['size_mb']:.1f}MB • Pages read: {doc['pages'] if doc['pages'] else 'N/A'}{extra}")
+
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                st.markdown("#### Summary")
+                st.write("\n".join([f"- {s}" for s in r["summary"]]) if r["summary"] else "No summary.")
+                st.markdown("#### Keywords")
+                st.write(", ".join(r["keywords"]) if r["keywords"] else "No keywords.")
+
+            with c2:
+                st.markdown("#### Highlights (inside original text)")
+                st.markdown(highlight_html(r["text"][:25000], r["keywords"]), unsafe_allow_html=True)
+                st.caption("Showing first ~25k characters for speed.")
+
+
+with tabs[1]:
+    st.subheader("History (this session)")
+    hist = st.session_state.history
+    if not hist:
+        st.info("No history yet.")
+    else:
+        for h in hist[:15]:
+            st.markdown(f"### {h['name']}")
+            sec = ""
+            if h.get("section"):
+                sec = f" • Section: {h['section']} • Range: {h['range'][0]}-{h['range'][1]}"
+            st.caption(f"{h['created_at']} • Size: {h['size_mb']:.1f}MB • Pages: {h['pages'] if h['pages'] else 'N/A'}{sec}")
+            st.write("\n".join([f"- {s}" for s in h["summary"]]) if h["summary"] else "No summary.")
+            st.write("Keywords: " + (", ".join(h["keywords"]) if h["keywords"] else "None"))
+            st.divider()
+
+        export = {"exported_at": time.strftime("%Y-%m-%d %H:%M:%S"), "history": hist}
+        st.download_button(
+            "⬇️ Download History (JSON)",
+            data=json.dumps(export, indent=2),
+            file_name="doc_summarizer_history.json",
+            mime="application/json"
         )
 
-    return f"""
-    <div style="white-space: pre-wrap; line-height: 1.6; font-family: system-ui;">
-      {esc}
-    </div>
-    """
-
-
-# -----------------------------
-# Export
-# -----------------------------
-def build_pdf_bytes(title: str, summary_block: str, takeaways: List[str], questions: List[str]) -> bytes:
-    styles = getSampleStyleSheet()
-    story = []
-    story.append(Paragraph(f"<b>{html.escape(title)}</b>", styles["Title"]))
-    story.append(Spacer(1, 0.4 * cm))
-
-    story.append(Paragraph("<b>Explanation Summary</b>", styles["Heading2"]))
-    story.append(Spacer(1, 0.2 * cm))
-    story.append(Paragraph(html.escape(summary_block), styles["BodyText"]))
-    story.append(Spacer(1, 0.3 * cm))
-
-    if takeaways:
-        story.append(Paragraph("<b>Key Takeaways</b>", styles["Heading2"]))
-        story.append(Spacer(1, 0.2 * cm))
-        story.append(ListFlowable([ListItem(Paragraph(html.escape(t), styles["BodyText"])) for t in takeaways], bulletType="bullet"))
-        story.append(Spacer(1, 0.3 * cm))
-
-    if questions:
-        story.append(Paragraph("<b>Practice Questions</b>", styles["Heading2"]))
-        story.append(Spacer(1, 0.2 * cm))
-        story.append(ListFlowable([ListItem(Paragraph(html.escape(q), styles["BodyText"])) for q in questions], bulletType="bullet"))
-
-    buf = BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=2*cm, leftMargin=2*cm, topMargin=2*cm, bottomMargin=2*cm)
-    doc.build(story)
-    return buf.getvalue()
-
-
-def build_docx_bytes(title: str, summary_block: str, takeaways: List[str], questions: List[str]) -> bytes:
-    doc = DocxDocument()
-    doc.add_heading(title, 0)
-
-    doc.add_heading("Explanation Summary", level=1)
-    doc.add_paragraph(summary_block)
-
-    if takeaways:
-        doc.add_heading("Key Takeaways", level=1)
-        for t in takeaways:
-            doc.add_paragraph(t, style="List Bullet")
-
-    if questions:
-        doc.add_heading("Practice Questions", level=1)
-        for q in questions:
-            doc.add_paragraph(q, style="List Bullet")
-
-    buf = BytesIO()
-    doc.save(buf)
-    return buf.getvalue()
-
-
-# -----------------------------
-# Lecturer-style explanation summary (structured)
-# -----------------------------
-def build_explanatory_summary(persona: str, summary_sents: List[str], concepts: Dict[str, List[str]]) -> Tuple[str, List[str]]:
-    """
-    Returns (summary_block, takeaways)
-    Uses a structured, lecturer-like format.
-    """
-    defs = concepts.get("definitions", [])
-    rules = concepts.get("rules", [])
-    risks = concepts.get("risks", [])
-    cause = concepts.get("cause_effect", [])
-    examples = concepts.get("examples", [])
-
-    core = summary_sents[:2]
-    explain = summary_sents[2:5]
-    extra = summary_sents[5:8]
-
-    # Make takeaways from strongest sentences (non-repeating)
-    takeaways = dedupe_questions([*core, *explain, *rules[:2], *risks[:2]], similarity_threshold=0.92)[:6]
-
-    # Persona tone
-    if persona == "Primary school learner":
-        header = "Simple Explanation"
-        guide = "Focus: understand the meaning, one idea at a time."
-    elif persona == "High school learner":
-        header = "Clear Explanation"
-        guide = "Focus: understand + connect ideas + prepare for tests."
-    elif persona == "Varsity student":
-        header = "Lecturer-Style Explanation"
-        guide = "Focus: meaning, assumptions, implications, and exam-style understanding."
-    elif persona == "Trader":
-        header = "Practical Clarity"
-        guide = "Focus: rules, mistakes, and how to apply it step-by-step."
-    elif persona == "Professional / Work":
-        header = "Work-Ready Summary"
-        guide = "Focus: decisions, actions, and risk controls."
-    else:
-        header = "Explanation Summary"
-        guide = "Focus: clarity and key points."
-
-    parts = []
-    parts.append(f"{header}\n{guide}\n")
-
-    if defs:
-        parts.append("1) Key Definitions\n- " + "\n- ".join(defs[:3]) + "\n")
-    if core:
-        parts.append("2) Core Idea\n- " + "\n- ".join(core) + "\n")
-    if cause:
-        parts.append("3) Cause → Effect (Why things happen)\n- " + "\n- ".join(cause[:3]) + "\n")
-    if rules:
-        parts.append("4) Rules / Requirements (What you MUST do)\n- " + "\n- ".join(rules[:3]) + "\n")
-    if risks:
-        parts.append("5) Risks / Mistakes (What can go wrong)\n- " + "\n- ".join(risks[:3]) + "\n")
-    if examples:
-        parts.append("6) Examples (How it looks in practice)\n- " + "\n- ".join(examples[:2]) + "\n")
-
-    if explain or extra:
-        combined = [*explain, *extra]
-        combined = [c for c in combined if len(c.strip()) > 20][:4]
-        if combined:
-            parts.append("7) Important Notes\n- " + "\n- ".join(combined) + "\n")
-
-    summary_block = "\n".join(parts).strip()
-    return summary_block, takeaways
-
-
-# -----------------------------
-# Main UI
-# -----------------------------
-def main():
-    lim, tier = auth_gate()
-
-    st.title(APP_TITLE)
-    st.caption(APP_TAGLINE)
-
-    # Scrollable role selector (selectbox scrolls when long)
-    st.sidebar.subheader("🧠 Who are you?")
-    persona = st.sidebar.selectbox(
-        "Choose one (the app adapts)",
-        [
-            "Varsity student",
-            "High school learner",
-            "Primary school learner",
-            "Trader",
-            "Professional / Work",
-            "General",
-        ],
-        index=0
-    )
-
-    persona_help = {
-        "Varsity student": "Hard questions: apply, compare, evaluate, scenarios. Lecturer-style summary.",
-        "High school learner": "Clear explanations + test-style questions + examples.",
-        "Primary school learner": "Simpler language + gentle questions.",
-        "Trader": "Turns docs into rules/checklist + scenarios + mistakes.",
-        "Professional / Work": "Action items + decisions + risks.",
-        "General": "Balanced summary + mixed questions."
-    }
-    st.sidebar.caption(persona_help.get(persona, ""))
-
-    st.sidebar.subheader("⚙️ Output settings")
-    summary_sentences = st.sidebar.slider("Summary strength (sentences)", 4, 14, 8)
-    question_count = st.sidebar.slider("Question count", 6, 20, 12)
-    keyword_count = st.sidebar.slider("Keyword count", 8, 30, 15)
-    quick_mode = st.sidebar.toggle("⚡ Quick mode (faster)", value=True)
-
-    # PDF pages slider (role-aware defaults)
-    default_pages = 50 if quick_mode else min(120, lim["max_pages"])
-    pages_to_analyze = st.sidebar.slider(
-        "Pages to analyze (PDF)",
-        5, lim["max_pages"], min(default_pages, lim["max_pages"])
-    )
-
-    st.write("Upload a **PDF, DOCX, or TXT**. The app will explain it, highlight what matters, and generate non-repeating questions.")
-    uploaded = st.file_uploader("Upload document", type=["pdf", "docx", "txt"])
-
-    if not uploaded:
-        st.info("Upload a document to begin.")
-        return
-
-    # size checks
-    data = uploaded.getvalue()
-    size_mb = len(data) / (1024 * 1024)
-    if size_mb > lim["max_mb"]:
-        st.error(f"File too large: {size_mb:.1f}MB. Max allowed is {lim['max_mb']}MB.")
-        return
-
-    # Process button prevents rerun reprocessing
-    if st.button("⚡ Process Document"):
-        st.session_state.docs_used += 1
-
-        with st.spinner("Reading document..."):
-            ext = uploaded.name.lower().split(".")[-1]
-            char_limit = lim["char_limit"]
-
-            if ext == "pdf":
-                raw_text, pages_done = extract_pdf_text_cached(data, pages_to_analyze, char_limit)
-            elif ext == "docx":
-                raw_text = extract_docx_text_cached(data, char_limit)
-                pages_done = None
-            else:
-                raw_text = extract_txt_cached(data, char_limit)
-                pages_done = None
-
-        if looks_scanned_or_empty(raw_text):
-            st.error(
-                "This PDF looks scanned/locked (no selectable text). "
-                "Try a selectable-text PDF or DOCX/TXT. (OCR can be added later.)"
-            )
-            return
-
-        # Sentence + concept analysis
-        sentences = split_sentences_fast(raw_text)
-        if len(sentences) < 4:
-            st.error("Not enough readable text extracted. Try another file.")
-            return
-
-        with st.spinner("Building explanation, highlights, and questions..."):
-            summary_sents = textrank_summary(sentences, top_n=summary_sentences)
-            concepts = concept_sentences(sentences)
-            keywords = tfidf_keywords(raw_text, k=keyword_count)
-
-            summary_block, takeaways = build_explanatory_summary(persona, summary_sents, concepts)
-
-            questions = build_advanced_questions(
-                persona=persona,
-                summary_sents=summary_sents,
-                keywords=keywords,
-                concepts=concepts,
-                n=question_count
-            )
-
-            # Final dedupe pass (safety)
-            questions = dedupe_questions(questions, similarity_threshold=0.90)
-
-        # Meta
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("File", uploaded.name)
-        c2.metric("Size (MB)", f"{size_mb:.1f}")
-        c3.metric("Chars used", f"{len(raw_text):,}")
-        c4.metric("PDF pages read", str(pages_done) if pages_done is not None else ext.upper())
-
-        t1, t2, t3, t4 = st.tabs(["✅ Explanation", "🟣 Highlights", "❓ Questions", "⬇️ Export"])
-
-        with t1:
-            st.subheader("Explanation (formal, simple, structured)")
-            st.text_area("Explanation Summary", summary_block, height=320)
-            st.subheader("Key Takeaways")
-            for t in takeaways:
-                st.write("•", t)
-
-        with t2:
-            st.subheader("Concept Highlights (not just keywords)")
-            st.caption("Blue=definitions • Orange=rules • Red=risks • Green=examples • Purple=cause/effect")
-            st.markdown(highlight_concepts(raw_text, concepts), unsafe_allow_html=True)
-
-        with t3:
-            st.subheader("Non-repeating Practice Questions")
-            st.caption("These questions are generated in different types (apply/compare/evaluate/scenario) depending on who you selected.")
-            for i, q in enumerate(questions, start=1):
-                st.write(f"**{i}.** {q}")
-
-        with t4:
-            st.subheader("Export (PDF / Word)")
-            pdf_bytes = build_pdf_bytes(uploaded.name, summary_block, takeaways, questions)
-            docx_bytes = build_docx_bytes(uploaded.name, summary_block, takeaways, questions)
-
-            st.download_button("⬇️ Download PDF", data=pdf_bytes, file_name="clarity_pack.pdf", mime="application/pdf")
-            st.download_button(
-                "⬇️ Download Word (.docx)",
-                data=docx_bytes,
-                file_name="clarity_pack.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            )
-
-    else:
-        st.warning("Click **⚡ Process Document** to generate results.")
-
-
-if __name__ == "__main__":
-    main()
+st.caption("Note: Scanned PDFs (images) need OCR to extract text. We can add OCR later.")
