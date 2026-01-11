@@ -1,6 +1,6 @@
-streamlit
-pypdf
-python-docx
-scikit-learn
-numpy
-reportlab
+streamlit>=1.33,<2
+pypdf>=4.2,<5
+python-docx>=1.1,<2
+reportlab>=4.2,<5
+scikit-learn>=1.4,<2
+numpy>=1.26,<3
