@@ -1,133 +1,421 @@
 import re
 import io
-import time
 import json
+import time
+import uuid
 import hashlib
+import secrets
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional, Any
+from typing import List, Tuple, Dict, Any, Optional
+from datetime import datetime, timedelta, timezone
 
-import numpy as np
 import streamlit as st
 from pypdf import PdfReader
 from docx import Document as DocxDocument
-from sklearn.feature_extraction.text import TfidfVectorizer
 
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm
+from reportlab.pdfgen import canvas as pdf_canvas
+
+from supabase import create_client
 
 # =========================
 # App Config
 # =========================
-APP_NAME = "DocSum"
-APP_VERSION = "v3.0 (MASTER: All features + TOC + Manual Range + PIN Gate + User Type ✅)"
+APP_NAME = "DocuLite"
+APP_VERSION = "MASTER v4.0 (Docs + Slides PDF + Sections + Glossary + Flashcards + Compare + Export + Supabase PINs)"
 st.set_page_config(page_title=APP_NAME, page_icon="📄", layout="wide")
 
 
 # =========================
-# Limits / Tiers
+# Tier Limits (your rules)
 # =========================
 @dataclass
 class Tier:
     name: str
     max_docs: int
     max_pages: int
-    max_file_mb: int
+    max_mb: int
+    max_devices_default: int
 
-FREE_TIER  = Tier("Free",  max_docs=2,  max_pages=150, max_file_mb=300)
-PAID_TIER  = Tier("Paid",  max_docs=10, max_pages=200, max_file_mb=300)
-OWNER_TIER = Tier("Owner", max_docs=50, max_pages=9999, max_file_mb=300)
+FREE_TIER = Tier("FREE", max_docs=2, max_pages=150, max_mb=300, max_devices_default=1)
+PAID_TIER = Tier("PAID", max_docs=10, max_pages=200, max_mb=300, max_devices_default=2)
+OWNER_TIER = Tier("OWNER", max_docs=9999, max_pages=9999, max_mb=300, max_devices_default=5)
 
 
 # =========================
-# Utilities
+# Secrets / Supabase
 # =========================
-def safe_hash_bytes(b: bytes) -> str:
-    h = hashlib.sha256()
-    chunk = 1024 * 1024
-    for i in range(0, len(b), chunk):
-        h.update(b[i:i+chunk])
-    return h.hexdigest()
+def _secret(name: str, default: str = "") -> str:
+    try:
+        return str(st.secrets.get(name, default)).strip()
+    except Exception:
+        return default
 
+SUPABASE_URL = _secret("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = _secret("SUPABASE_SERVICE_ROLE_KEY")
+PIN_SALT = _secret("PIN_SALT")
+OWNER_ADMIN_PIN = _secret("OWNER_ADMIN_PIN")
+
+@st.cache_resource
+def sb():
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError("Supabase secrets missing. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Streamlit Secrets.")
+    return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+def hash_pin(pin: str) -> str:
+    s = (PIN_SALT + (pin or "").strip()).encode("utf-8")
+    return hashlib.sha256(s).hexdigest()
+
+def generate_pin() -> str:
+    raw = secrets.token_urlsafe(10).replace("-", "").replace("_", "").upper()
+    raw = raw[:12]
+    return f"{raw[:4]}-{raw[4:8]}-{raw[8:12]}"
+
+def get_headers_safe() -> Dict[str, str]:
+    # Streamlit may or may not expose headers depending on environment
+    try:
+        return dict(st.context.headers)  # type: ignore
+    except Exception:
+        return {}
+
+def device_fingerprint() -> str:
+    """
+    Not perfect, but blocks casual PIN sharing.
+    We also store a session UUID to differentiate devices behind same NAT.
+    """
+    if "device_uuid" not in st.session_state:
+        st.session_state.device_uuid = uuid.uuid4().hex
+
+    h = get_headers_safe()
+    ua = h.get("User-Agent", "")
+    ip = h.get("X-Forwarded-For", "")
+    ip = ip.split(",")[0].strip()
+
+    base = f"{ua}|{ip}|{st.session_state.device_uuid}"
+    return hashlib.sha256((PIN_SALT + base).encode("utf-8")).hexdigest()[:24]
+
+def tier_from_name(name: str) -> Tier:
+    if name == "OWNER":
+        return OWNER_TIER
+    if name == "PAID":
+        return PAID_TIER
+    return FREE_TIER
+
+def verify_pin_and_bind(pin: str) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+    pin = (pin or "").strip()
+    if not pin:
+        return False, "Enter a PIN.", None
+
+    if not PIN_SALT:
+        return False, "PIN_SALT is missing in Secrets.", None
+
+    h = hash_pin(pin)
+    client = sb()
+
+    res = client.table("pins").select("*").eq("pin_hash", h).limit(1).execute()
+    if not res.data:
+        return False, "Invalid PIN.", None
+
+    row = res.data[0]
+    if row.get("status") != "ACTIVE":
+        return False, "This PIN is revoked.", row
+
+    if row.get("expires_at"):
+        exp = datetime.fromisoformat(str(row["expires_at"]).replace("Z", "+00:00"))
+        if datetime.now(timezone.utc) > exp:
+            return False, "This PIN has expired.", row
+
+    dev = device_fingerprint()
+    devices = row.get("devices") or []
+    max_devices = int(row.get("max_devices") or 1)
+
+    if dev not in devices:
+        if len(devices) >= max_devices:
+            return False, "PIN device limit reached. Contact the owner.", row
+        devices.append(dev)
+        client.table("pins").update({"devices": devices}).eq("id", row["id"]).execute()
+        row["devices"] = devices
+
+    return True, f"Unlocked: {row['tier']}", row
+
+
+# =========================
+# Text Cleanup (fix spaced letters)
+# =========================
+STOPWORDS = set("""
+a an the and or but if while to of in on for with without at by from as is are was were be been being
+this that these those it its into about over under between among than then so because therefore
+i you he she they we them us our your my mine theirs his her
+""".split())
 
 def fix_spaced_letters(text: str) -> str:
-    """Fix 'p s y c h o l o g y' -> 'psychology' and hyphen line breaks."""
     if not text:
         return text
 
     def _join(match):
         return match.group(0).replace(" ", "")
 
+    # "C O N T E N T S" -> "CONTENTS"
     text = re.sub(r'(?<!\w)(?:[A-Za-z]\s){2,}[A-Za-z](?!\w)', _join, text)
+
+    # hyphen line break: "inter-\nnational" -> "international"
     text = re.sub(r'(\w)-\s*\n\s*(\w)', r'\1\2', text)
+
+    # tidy
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-
 def normalize_text(s: str) -> str:
     if not s:
         return ""
-    s = s.replace("\r", "\n")
+    s = s.replace("\r", "\n").replace("\u00a0", " ")
     s = re.sub(r"[ \t]{2,}", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s).strip()
     s = fix_spaced_letters(s)
+    # convert single newlines into spaces (keep paragraphs)
+    s = re.sub(r"(?<!\n)\n(?!\n)", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s).strip()
     return s
 
-
-def remove_toc_noise(text: str) -> str:
-    """Remove table-of-contents-like dotted lines and heavy page-number lines."""
-    lines = text.splitlines()
-    cleaned = []
-    for ln in lines:
-        s = ln.strip()
-        if not s:
-            continue
-        if re.search(r"\.{3,}", s):
-            continue
-        if len(re.findall(r"\d", s)) >= 7 and len(s) <= 90:
-            continue
-        cleaned.append(ln)
-    return "\n".join(cleaned).strip()
-
-
 def sentence_split(text: str) -> List[str]:
-    """Fast sentence splitter (no NLTK)."""
-    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+", " ", (text or "")).strip()
     if not text:
         return []
     parts = re.split(r'(?<=[.!?])\s+(?=[A-Z0-9"“‘])', text)
     return [p.strip() for p in parts if p.strip()]
 
+def tokenize_words(text: str) -> List[str]:
+    words = re.findall(r"[A-Za-z][A-Za-z'\-]{1,}", (text or "").lower())
+    return [w for w in words if w not in STOPWORDS and len(w) >= 3]
+
+def jaccard(a: str, b: str) -> float:
+    sa = set(tokenize_words(a))
+    sb = set(tokenize_words(b))
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / max(1, len(sa | sb))
+
 
 # =========================
-# PIN / Access
+# Keyword + Summary (fast, no NLTK, no sklearn)
 # =========================
-def get_secret(key: str) -> str:
+def extract_keywords(text: str, top_k: int = 12) -> List[str]:
+    """
+    A fast “RAKE-lite” scoring:
+    - unigram + bigram candidates
+    - frequency * log-length
+    """
+    text = (text or "")
+    if len(text) < 60:
+        return []
+
+    words = tokenize_words(text)
+    if not words:
+        return []
+
+    freq: Dict[str, int] = {}
+    for w in words:
+        freq[w] = freq.get(w, 0) + 1
+
+    # bigrams
+    bigrams: Dict[str, int] = {}
+    for i in range(len(words) - 1):
+        bg = f"{words[i]} {words[i+1]}"
+        if words[i] in STOPWORDS or words[i+1] in STOPWORDS:
+            continue
+        bigrams[bg] = bigrams.get(bg, 0) + 1
+
+    scored: List[Tuple[str, float]] = []
+    for w, c in freq.items():
+        scored.append((w, c * 1.0))
+
+    for bg, c in bigrams.items():
+        scored.append((bg, c * 1.8))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    out = []
+    seen = set()
+    for term, _ in scored:
+        t = term.strip().lower()
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(term)
+        if len(out) >= top_k:
+            break
+    return out
+
+def summarize(text: str, n_sent: int, user_type: str) -> List[str]:
+    sents = sentence_split(text)
+    if not sents:
+        return []
+
+    # user_type tuning
+    if user_type == "Primary learner":
+        n_sent = max(3, min(n_sent, 5))
+    elif user_type == "High school learner":
+        n_sent = max(4, min(n_sent, 7))
+    elif user_type == "Varsity/College":
+        n_sent = max(6, min(n_sent, 10))
+    elif user_type == "Trader":
+        n_sent = max(6, min(n_sent, 10))
+    else:
+        n_sent = max(5, min(n_sent, 9))
+
+    kws = set([k.split()[0].lower() for k in extract_keywords(text, top_k=20) if k])
+    scores = []
+    for idx, s in enumerate(sents):
+        w = tokenize_words(s)
+        hit = sum(1 for x in w if x in kws)
+        density = hit / max(1, len(w))
+        length_penalty = 1.0 if len(s) <= 220 else max(0.6, 220 / len(s))
+        score = (hit + 2.0 * density) * length_penalty
+        scores.append((idx, s, score))
+
+    scores.sort(key=lambda x: x[2], reverse=True)
+    picked = sorted(scores[: min(n_sent, len(scores))], key=lambda x: x[0])
+    return [re.sub(r"\s+", " ", s).strip() for _, s, _ in picked]
+
+def key_takeaways(text: str, k: int = 6) -> List[str]:
+    sents = sentence_split(text)
+    if not sents:
+        return []
+    # take top summary sentences then diversify
+    candidates = summarize(text, n_sent=min(14, max(8, k * 2)), user_type="Varsity/College")
+    out: List[str] = []
+    for s in candidates:
+        if len(out) >= k:
+            break
+        if all(jaccard(s, prev) < 0.55 for prev in out):
+            out.append(s)
+    return out
+
+
+# =========================
+# Questions (non-repeating + difficulty by user type)
+# =========================
+def generate_questions(text: str, user_type: str, n: int = 10) -> List[str]:
+    kws = extract_keywords(text, top_k=max(20, n * 3))
+    takes = key_takeaways(text, k=5)
+
+    if user_type == "Primary learner":
+        templates = [
+            "What does '{k}' mean?",
+            "Give an example of '{k}'.",
+            "Explain '{k}' in your own words.",
+            "Write one fact about '{k}'.",
+        ]
+    elif user_type == "High school learner":
+        templates = [
+            "Define '{k}'.",
+            "Why is '{k}' important in this document?",
+            "Compare '{k}' with another idea from the text.",
+            "Give an example and explain '{k}'.",
+        ]
+    elif user_type == "Trader":
+        templates = [
+            "Explain '{k}' and how to use it in a trading plan (steps).",
+            "What mistake happens if '{k}' is misunderstood?",
+            "Create a checklist that includes '{k}'.",
+            "When might '{k}' fail? Give one condition.",
+        ]
+    else:  # Varsity/General
+        templates = [
+            "Critically evaluate '{k}' based on the text.",
+            "How does '{k}' connect to the main argument?",
+            "Identify assumptions behind '{k}'.",
+            "Apply '{k}' to a real-world scenario and justify.",
+        ]
+
+    base: List[str] = []
+    for i, k in enumerate(kws):
+        base.append(templates[i % len(templates)].format(k=k))
+
+    for t in takes:
+        base.append(f"Explain the meaning of this statement and why it matters: “{t[:120]}…”")
+
+    # Diversify so questions don’t repeat
+    picked: List[str] = []
+    for q in base:
+        if len(picked) >= n:
+            break
+        if all(jaccard(q, prev) < 0.55 for prev in picked):
+            picked.append(q)
+    return picked[:n]
+
+
+# =========================
+# Highlighting (in original text)
+# =========================
+def highlight_html(text: str, keywords: List[str], max_chars: int = 120000) -> str:
+    text = (text or "")[:max_chars]
+    safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    keywords = sorted([k.strip() for k in (keywords or []) if k.strip()], key=len, reverse=True)
+
+    for kw in keywords[:25]:
+        pat = re.compile(rf"(?i)\b({re.escape(kw)})\b")
+        safe = pat.sub(r"<mark>\1</mark>", safe)
+
+    return f"<div style='white-space:pre-wrap; line-height:1.65'>{safe}</div>"
+
+
+# =========================
+# PDF / DOCX / TXT Extraction
+# =========================
+def bytes_mb(b: bytes) -> float:
+    return len(b) / (1024 * 1024)
+
+def extract_docx_text(file_bytes: bytes) -> str:
+    doc = DocxDocument(io.BytesIO(file_bytes))
+    paras = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
+    return normalize_text("\n".join(paras))
+
+def extract_txt_text(file_bytes: bytes) -> str:
     try:
-        return str(st.secrets.get(key, "")).strip()
+        return normalize_text(file_bytes.decode("utf-8", errors="ignore"))
     except Exception:
         return ""
 
+def pdf_total_pages(file_bytes: bytes) -> int:
+    reader = PdfReader(io.BytesIO(file_bytes))
+    return len(reader.pages)
 
-REQUIRE_PIN = get_secret("REQUIRE_PIN").lower() in ("1", "true", "yes", "y")
-OWNER_PIN = get_secret("OWNER_PIN")
-PAID_PIN  = get_secret("PAID_PIN")
-FREE_PIN  = get_secret("FREE_PIN")
+def extract_pdf_range(file_bytes: bytes, start_page1: int, end_page1: int, progress_cb=None) -> Tuple[str, List[str], int]:
+    """
+    Returns:
+      full_text, per_page_texts, pages_read
+    """
+    reader = PdfReader(io.BytesIO(file_bytes))
+    total = len(reader.pages)
+    start0 = max(0, min(total - 1, start_page1 - 1))
+    end0 = max(0, min(total - 1, end_page1 - 1))
+    if end0 < start0:
+        start0, end0 = end0, start0
 
+    pages_to_read = end0 - start0 + 1
+    per_page = []
+    out = []
 
-def tier_from_pin(pin: str) -> Tuple[Tier, str]:
-    pin = (pin or "").strip()
-    if OWNER_PIN and pin == OWNER_PIN:
-        return OWNER_TIER, "Owner"
-    if PAID_PIN and pin == PAID_PIN:
-        return PAID_TIER, "Paid"
-    if FREE_PIN and pin == FREE_PIN:
-        return FREE_TIER, "Free"
-    return Tier("Locked", 0, 0, 0), "Locked"
+    for j, i in enumerate(range(start0, end0 + 1), start=1):
+        try:
+            t = reader.pages[i].extract_text() or ""
+        except Exception:
+            t = ""
+        t = normalize_text(t)
+        per_page.append(t)
+        if t:
+            out.append(t)
+        if progress_cb:
+            progress_cb(j, pages_to_read)
+
+    return normalize_text("\n\n".join(out)), per_page, pages_to_read
 
 
 # =========================
-# Heading detection
-# (1) TOC / bookmarks
-# (2) scan first X pages fallback
+# TOC/Headings Section Detection (PDF)
 # =========================
 HEADING_PATTERNS = [
     r'^\s*chapter\s+\d+\b.*$',
@@ -136,14 +424,13 @@ HEADING_PATTERNS = [
 ]
 
 def looks_like_heading(line: str) -> bool:
-    s = line.strip()
+    s = (line or "").strip()
     if len(s) < 6 or len(s) > 120:
         return False
     for pat in HEADING_PATTERNS:
         if re.match(pat, s, flags=re.IGNORECASE):
             return True
     return False
-
 
 def _flatten_outline(outline: Any) -> List[Any]:
     items = []
@@ -156,96 +443,68 @@ def _flatten_outline(outline: Any) -> List[Any]:
         items.append(outline)
     return items
 
-
-def _outline_title(obj: Any) -> Optional[str]:
-    for attr in ("title", "Title"):
-        if hasattr(obj, attr):
-            t = getattr(obj, attr)
-            if isinstance(t, str) and t.strip():
-                return t.strip()
-    if isinstance(obj, dict):
-        t = obj.get("/Title") or obj.get("Title")
-        if isinstance(t, str) and t.strip():
-            return t.strip()
-    return None
-
-
-@st.cache_data(show_spinner=False)
-def toc_headings(file_id: str, file_bytes: bytes) -> List[Tuple[str, int]]:
-    """Try to read PDF TOC/bookmarks. Return list of (title, page0)."""
+def toc_sections(file_bytes: bytes) -> List[Tuple[str, int]]:
     try:
         reader = PdfReader(io.BytesIO(file_bytes))
         outline = getattr(reader, "outline", None)
-        if outline is None:
+        if not outline:
             return []
         flat = _flatten_outline(outline)
-
         found: List[Tuple[str, int]] = []
         seen = set()
-
         for item in flat:
             try:
-                title = _outline_title(item)
+                title = getattr(item, "title", None)
                 if not title:
                     continue
                 page0 = reader.get_destination_page_number(item)
                 if page0 is None:
                     continue
-                key = re.sub(r"\s+", " ", title).lower()
+                key = re.sub(r"\s+", " ", str(title)).lower()
                 if key in seen:
                     continue
                 seen.add(key)
-                found.append((title, int(page0)))
+                found.append((str(title).strip()[:80], int(page0)))
             except Exception:
                 continue
-
         found.sort(key=lambda x: x[1])
         if found and found[0][1] > 0:
-            found.insert(0, ("Start (before first TOC item)", 0))
+            found.insert(0, ("Start", 0))
         return found
     except Exception:
         return []
 
-
-@st.cache_data(show_spinner=False)
-def scan_pdf_headings(file_id: str, file_bytes: bytes, scan_pages: int) -> List[Tuple[str, int]]:
-    """Scan first scan_pages pages for headings."""
-    reader = PdfReader(io.BytesIO(file_bytes))
-    total_pages = len(reader.pages)
-    scan_pages = min(scan_pages, total_pages)
-
-    headings: List[Tuple[str, int]] = []
-    seen = set()
-
-    for i in range(scan_pages):
-        try:
-            page_text = reader.pages[i].extract_text() or ""
-        except Exception:
-            page_text = ""
-
-        page_text = normalize_text(page_text)
-        for ln in page_text.splitlines():
-            t = ln.strip()
-            if not t:
-                continue
-            if looks_like_heading(t):
-                key = re.sub(r"\s+", " ", t).lower()
-                if key in seen:
+def scan_headings(file_bytes: bytes, scan_pages: int = 30) -> List[Tuple[str, int]]:
+    try:
+        reader = PdfReader(io.BytesIO(file_bytes))
+        total = len(reader.pages)
+        scan_pages = min(max(5, scan_pages), total)
+        hits: List[Tuple[str, int]] = []
+        seen = set()
+        for i in range(scan_pages):
+            try:
+                txt = reader.pages[i].extract_text() or ""
+            except Exception:
+                txt = ""
+            txt = normalize_text(txt)
+            for ln in txt.splitlines()[:40]:
+                t = ln.strip()
+                if not t:
                     continue
-                seen.add(key)
-                headings.append((t, i))
-        if len(headings) >= 40:
-            break
+                if looks_like_heading(t):
+                    key = re.sub(r"\s+", " ", t).lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    hits.append((t[:80], i))
+        if hits and hits[0][1] > 0:
+            hits.insert(0, ("Start", 0))
+        hits.sort(key=lambda x: x[1])
+        return hits[:50]
+    except Exception:
+        return []
 
-    if not headings:
-        return [("Whole Document (no headings detected)", 0)]
-    if headings[0][1] > 0:
-        headings.insert(0, ("Start (before first heading)", 0))
-    return headings
-
-
-def compute_heading_ranges(headings: List[Tuple[str, int]], total_pages: int) -> List[Tuple[str, int, int]]:
-    """(title, start0) -> (title, start1, end1 inclusive)"""
+def heading_ranges(headings: List[Tuple[str, int]], total_pages: int) -> List[Tuple[str, int, int]]:
     ranges = []
     for idx, (title, start0) in enumerate(headings):
         start1 = start0 + 1
@@ -260,544 +519,13 @@ def compute_heading_ranges(headings: List[Tuple[str, int]], total_pages: int) ->
 
 
 # =========================
-# Extraction (with progress)
+# Sections Splitter (text-based, for non-PDF or fallback)
 # =========================
-def extract_pdf_text_range(file_bytes: bytes, start_page1: int, end_page1: int, progress_cb=None) -> Tuple[str, int]:
-    reader = PdfReader(io.BytesIO(file_bytes))
-    total_pages = len(reader.pages)
-
-    start0 = max(0, start_page1 - 1)
-    end0 = min(total_pages - 1, end_page1 - 1)
-    pages_to_read = max(0, end0 - start0 + 1)
-
-    out = []
-    for j, i in enumerate(range(start0, end0 + 1), start=1):
-        try:
-            page_text = reader.pages[i].extract_text() or ""
-        except Exception:
-            page_text = ""
-        out.append(page_text)
-        if progress_cb:
-            progress_cb(j, pages_to_read)
-
-    text = "\n".join(out)
-    return normalize_text(remove_toc_noise(text)), pages_to_read
-
-
-def extract_docx_text(file_bytes: bytes) -> str:
-    doc = DocxDocument(io.BytesIO(file_bytes))
-    paras = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
-    return normalize_text("\n".join(paras))
-
-
-def extract_txt_text(file_bytes: bytes) -> str:
-    try:
-        return normalize_text(file_bytes.decode("utf-8", errors="ignore"))
-    except Exception:
-        return ""
-
-
-def extract_text_any(uploaded_file, tier: Tier) -> Dict:
-    """Normal extract for non-PDF or multi-upload, with progress for PDF."""
-    file_bytes = uploaded_file.getvalue()
-    size_mb = len(file_bytes) / (1024 * 1024)
-    if size_mb > tier.max_file_mb:
-        raise ValueError(f"File too large: {size_mb:.1f}MB. Limit {tier.max_file_mb}MB.")
-
-    name = uploaded_file.name.lower()
-    mime = (uploaded_file.type or "").lower()
-    file_id = safe_hash_bytes(file_bytes)
-
-    progress = st.progress(0, text="Preparing…")
-    status = st.empty()
-
-    def prog(done, total):
-        pct = int((done / max(total, 1)) * 100)
-        progress.progress(pct, text=f"Extracting pages… {done}/{total}")
-        status.info(f"Reading page {done} of {total}")
-
-    if name.endswith(".pdf") or "pdf" in mime:
-        reader = PdfReader(io.BytesIO(file_bytes))
-        total_pages = len(reader.pages)
-        pages_to_read = min(total_pages, tier.max_pages)
-
-        out = []
-        for i in range(pages_to_read):
-            try:
-                page_text = reader.pages[i].extract_text() or ""
-            except Exception:
-                page_text = ""
-            out.append(page_text)
-            prog(i + 1, pages_to_read)
-
-        text = normalize_text(remove_toc_noise("\n".join(out)))
-        progress.progress(100, text="Done extracting.")
-        status.success(f"Extracted {pages_to_read} page(s).")
-        return {"id": file_id, "name": uploaded_file.name, "type": "pdf", "text": text, "pages": pages_to_read, "size_mb": size_mb}
-
-    if name.endswith(".docx") or "word" in mime:
-        progress.progress(40, text="Reading DOCX…")
-        text = extract_docx_text(file_bytes)
-        progress.progress(100, text="Done extracting.")
-        status.success("DOCX extracted.")
-        return {"id": file_id, "name": uploaded_file.name, "type": "docx", "text": text, "pages": None, "size_mb": size_mb}
-
-    if name.endswith(".txt") or "text" in mime:
-        progress.progress(40, text="Reading TXT…")
-        text = extract_txt_text(file_bytes)
-        progress.progress(100, text="Done extracting.")
-        status.success("TXT extracted.")
-        return {"id": file_id, "name": uploaded_file.name, "type": "txt", "text": text, "pages": None, "size_mb": size_mb}
-
-    raise ValueError("Unsupported file type. Upload PDF, DOCX, or TXT.")
-
-
-# =========================
-# Analysis / Output
-# =========================
-def extract_keywords(text: str, top_k: int = 12) -> List[str]:
-    text = re.sub(r"\s+", " ", text).strip()
-    if len(text) < 60:
-        return []
-    try:
-        vec = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=7000)
-        X = vec.fit_transform([text])
-        feats = np.array(vec.get_feature_names_out())
-        scores = X.toarray().flatten()
-        idx = np.argsort(scores)[::-1][:top_k]
-        kws = [feats[i] for i in idx if scores[i] > 0]
-        out, seen = [], set()
-        for k in kws:
-            k2 = k.lower().strip()
-            if k2 in seen:
-                continue
-            seen.add(k2)
-            out.append(k.strip())
-        return out
-    except Exception:
-        return []
-
-
-def summarize_sentences(text: str, n_sent: int, user_type: str) -> List[str]:
-    sents = sentence_split(text)
-    if not sents:
-        return []
-
-    # user-type tuning (keeps app fast but improves relevance)
-    if user_type == "Primary learner":
-        n_sent = max(3, min(n_sent, 5))
-    elif user_type == "High school learner":
-        n_sent = max(3, min(n_sent, 6))
-    elif user_type == "Varsity/College":
-        n_sent = max(5, min(n_sent, 10))
-    elif user_type == "Professional":
-        n_sent = max(5, min(n_sent, 10))
-    elif user_type == "Trader":
-        n_sent = max(5, min(n_sent, 10))
-
-    try:
-        vec = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=9000)
-        X = vec.fit_transform(sents)
-        scores = np.asarray(X.sum(axis=1)).ravel()
-        top_idx = np.argsort(scores)[::-1][:min(n_sent, len(sents))]
-        top_idx_sorted = sorted(top_idx)  # keep order
-        picked = [re.sub(r"\s+", " ", sents[i].strip()) for i in top_idx_sorted]
-        return picked
-    except Exception:
-        return sents[:n_sent]
-
-
-def highlight_html(text: str, keywords: List[str]) -> str:
-    if not text:
-        return ""
-    safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    keywords = sorted([k.strip() for k in keywords if k.strip()], key=lambda x: len(x), reverse=True)
-    for kw in keywords[:25]:
-        pat = re.compile(rf"(?i)\b({re.escape(kw)})\b")
-        safe = pat.sub(r"<mark>\1</mark>", safe)
-    return f"<div style='white-space:pre-wrap; line-height:1.65'>{safe}</div>"
-
-
-# =========================
-# Glossary (user searches a term)
-# =========================
-DEF_PATTERNS = [
-    r"\b{w}\b\s+(is|are|means|refers to|defined as)\s+(.+?)([.;]|$)",
-    r"(.+?)\s+(is|are)\s+called\s+\b{w}\b([.;]|$)",
-]
-
-def glossary_define(word: str, text: str, max_results: int = 6) -> List[str]:
-    if not word or not text:
-        return []
-    w = re.escape(word.strip())
-    sents = sentence_split(text)
-    hits = []
-
-    for sent in sents:
-        s = sent.strip()
-        if len(s) < 15:
-            continue
-        if re.search(rf"(?i)\b{w}\b", s) is None:
-            continue
-        for pat in DEF_PATTERNS:
-            m = re.search(pat.format(w=w), s, flags=re.IGNORECASE)
-            if m:
-                hits.append(s)
-                break
-        if len(hits) >= max_results:
-            break
-
-    if hits:
-        return hits[:max_results]
-
-    # fallback context sentences
-    ctx = []
-    for sent in sents:
-        if re.search(rf"(?i)\b{w}\b", sent):
-            ctx.append(sent.strip())
-        if len(ctx) >= max_results:
-            break
-    return ctx
-
-
-# =========================
-# Flashcards
-# =========================
-def make_flashcards(text: str, keywords: List[str], n_cards: int = 10) -> List[Dict]:
-    sents = sentence_split(text)
-    if not sents:
-        return []
-    cand = [s for s in sents if len(s) >= 70] or sents
-
-    pool = [k for k in keywords if 3 <= len(k) <= 35]
-    pool = list(dict.fromkeys(pool))
-    if len(pool) < 4:
-        pool += extract_keywords(text, top_k=15)
-        pool = list(dict.fromkeys(pool))
-
-    rng = np.random.default_rng(7)
-    rng.shuffle(cand)
-
-    cards = []
-    used = set()
-
-    for sent in cand:
-        if len(cards) >= n_cards:
-            break
-        chosen = None
-        for k in pool:
-            if re.search(rf"(?i)\b{re.escape(k)}\b", sent):
-                chosen = k
-                break
-        if not chosen:
-            continue
-
-        key = (sent[:70] + chosen).lower()
-        if key in used:
-            continue
-        used.add(key)
-
-        blanked = re.sub(rf"(?i)\b{re.escape(chosen)}\b", "_____", sent, count=1)
-
-        if len(cards) % 2 == 0:
-            cards.append({"type": "typed", "question": f"Fill in the missing term:\n\n{blanked}", "answer": chosen.strip()})
-        else:
-            distractors = [x for x in pool if x.lower() != chosen.lower()]
-            rng.shuffle(distractors)
-            options = [chosen] + distractors[:3]
-            rng.shuffle(options)
-            cards.append({"type": "mcq", "question": f"Which term best completes the sentence?\n\n{blanked}", "answer": chosen.strip(), "options": options})
-
-    return cards[:n_cards]
-
-
-# =========================
-# Session State
-# =========================
-def init_state():
-    if "history" not in st.session_state:
-        st.session_state.history = []
-    if "last_result" not in st.session_state:
-        st.session_state.last_result = None
-    if "auth" not in st.session_state:
-        st.session_state.auth = {"ok": False, "tier": FREE_TIER, "mode": "Free"}
-
-init_state()
-
-
-# =========================
-# Sidebar: Access + User Type
-# =========================
-st.sidebar.title("🔐 Access")
-st.sidebar.caption(APP_VERSION)
-
-# If REQUIRE_PIN is true, enforce gate. If false, allow free without pin.
-pin = st.sidebar.text_input("Enter PIN (if you have one)", type="password")
-if st.sidebar.button("Apply PIN"):
-    t, m = tier_from_pin(pin)
-    if m == "Locked":
-        st.sidebar.error("Wrong PIN.")
-        if REQUIRE_PIN:
-            st.session_state.auth = {"ok": False, "tier": Tier("Locked", 0, 0, 0), "mode": "Locked"}
-        else:
-            st.session_state.auth = {"ok": True, "tier": FREE_TIER, "mode": "Free"}
-    else:
-        st.session_state.auth = {"ok": True, "tier": t, "mode": m}
-        st.sidebar.success(f"Unlocked: {m}")
-
-# Default auth state on first load
-if not st.session_state.auth.get("ok", False):
-    if REQUIRE_PIN:
-        st.session_state.auth = {"ok": False, "tier": Tier("Locked", 0, 0, 0), "mode": "Locked"}
-    else:
-        st.session_state.auth = {"ok": True, "tier": FREE_TIER, "mode": "Free"}
-
-auth = st.session_state.auth
-
-if REQUIRE_PIN and not auth["ok"]:
-    st.title(f"📄 {APP_NAME}")
-    st.error("🔒 Locked. Enter a valid PIN in the sidebar to use the app.")
-    st.stop()
-
-tier = auth["tier"]
-mode = auth["mode"]
-
-st.sidebar.success(f"Mode: {mode} • Max docs: {tier.max_docs} • Max pages: {tier.max_pages} • Max file: {tier.max_file_mb}MB")
-
-st.sidebar.divider()
-st.sidebar.title("👤 User Type")
-user_type = st.sidebar.selectbox(
-    "Choose your category",
-    ["Primary learner", "High school learner", "Varsity/College", "Professional", "Trader"],
-)
-
-summary_sentences = st.sidebar.slider("Summary length (sentences)", 3, 12, 6)
-keyword_count = st.sidebar.slider("Keywords to highlight", 5, 30, 12)
-flashcard_count = st.sidebar.slider("Flashcards to generate", 5, 25, 10)
-
-st.sidebar.caption("Tip: For big books, use Auto section or Manual page range.")
-
-
-# =========================
-# Main UI (ALL tabs preserved ✅)
-# =========================
-st.title(f"📄 {APP_NAME}")
-st.caption(f"Access: {mode} • User Type: {user_type}")
-
-tabs = st.tabs(["✅ Process", "🧩 Sections", "📘 Glossary", "🃏 Flashcards", "🆚 Compare", "🕘 History"])
-
-# -------------------------
-# Process Tab
-# -------------------------
-with tabs[0]:
-    st.subheader("Upload & Process")
-    st.write("Upload PDF / DOCX / TXT and generate summary, keywords, highlights.")
-
-    uploaded = st.file_uploader(
-        f"Upload up to {tier.max_docs} document(s)",
-        type=["pdf", "docx", "txt"],
-        accept_multiple_files=True
-    )
-
-    # For 1 PDF: allow TOC/Scan + Manual Range
-    section_mode = None
-    scan_pages = 30
-    selected_range = None
-    manual_start, manual_end = 1, 1
-
-    if uploaded and len(uploaded) == 1:
-        f = uploaded[0]
-        name = f.name.lower()
-        mime = (f.type or "").lower()
-
-        if name.endswith(".pdf") or ("pdf" in mime):
-            file_bytes = f.getvalue()
-            size_mb = len(file_bytes) / (1024 * 1024)
-
-            if size_mb > tier.max_file_mb:
-                st.error(f"File too large: {size_mb:.1f}MB. Limit {tier.max_file_mb}MB.")
-                st.stop()
-
-            reader = PdfReader(io.BytesIO(file_bytes))
-            total_pages = len(reader.pages)
-
-            st.markdown("### ⚡ PDF: Select Pages (TOC / Scan / Manual)")
-            section_mode = st.radio(
-                "Choose a mode",
-                ["Auto section (TOC → Scan headings)", "Manual page range", "Full (limited by tier)"],
-                horizontal=True
-            )
-
-            if section_mode == "Auto section (TOC → Scan headings)":
-                scan_pages = st.slider("If TOC fails, scan first pages for headings", 5, 120, 30)
-                file_id = safe_hash_bytes(file_bytes)
-
-                with st.spinner("Trying TOC/bookmarks…"):
-                    toc = toc_headings(file_id, file_bytes)
-
-                if toc:
-                    st.success("✅ TOC found.")
-                    headings = toc
-                else:
-                    st.warning("No TOC found. Scanning headings…")
-                    headings = scan_pdf_headings(file_id, file_bytes, scan_pages)
-
-                ranges = compute_heading_ranges(headings, total_pages)
-                labels = [f"{t}  (pages {s}-{e})" for (t, s, e) in ranges]
-                pick = st.selectbox("Choose section", labels)
-                selected_range = ranges[labels.index(pick)]
-                st.info("This will extract ONLY the selected range.")
-
-            elif section_mode == "Manual page range":
-                c1, c2 = st.columns(2)
-                with c1:
-                    manual_start = st.number_input("Start page", min_value=1, max_value=total_pages, value=1)
-                with c2:
-                    manual_end = st.number_input("End page", min_value=1, max_value=total_pages, value=min(total_pages, tier.max_pages))
-                st.info("This will extract ONLY the pages you selected.")
-
-            else:
-                st.info("This will extract from page 1 up to your tier max pages.")
-
-    if uploaded:
-        if len(uploaded) > tier.max_docs:
-            st.error(f"Too many files. Your limit is {tier.max_docs}.")
-            st.stop()
-
-        if st.button("⚡ Process Now"):
-            results = []
-
-            for f in uploaded:
-                st.info(f"Processing: {f.name}")
-                try:
-                    name = f.name.lower()
-                    mime = (f.type or "").lower()
-
-                    # 1 PDF with page selection
-                    if len(uploaded) == 1 and (name.endswith(".pdf") or ("pdf" in mime)) and section_mode is not None:
-                        file_bytes = f.getvalue()
-                        reader = PdfReader(io.BytesIO(file_bytes))
-                        total_pages = len(reader.pages)
-
-                        start1, end1 = 1, min(total_pages, tier.max_pages)
-                        section_label = None
-
-                        if section_mode == "Auto section (TOC → Scan headings)" and selected_range is not None:
-                            section_label, start1, end1 = selected_range
-
-                        elif section_mode == "Manual page range":
-                            section_label = "Manual Range"
-                            start1, end1 = int(manual_start), int(manual_end)
-
-                        # normalize
-                        if start1 > end1:
-                            start1, end1 = end1, start1
-
-                        span = end1 - start1 + 1
-                        if span > tier.max_pages:
-                            end1 = start1 + tier.max_pages - 1
-                            st.warning(f"Limited to {tier.max_pages} pages: {start1}-{end1}")
-
-                        progress = st.progress(0, text="Preparing…")
-                        status = st.empty()
-
-                        def prog(done, total):
-                            pct = int((done / max(total, 1)) * 100)
-                            progress.progress(pct, text=f"Extracting pages… {done}/{total}")
-                            status.info(f"Reading page {done} of {total}")
-
-                        text, pages_read = extract_pdf_text_range(file_bytes, start1, end1, progress_cb=prog)
-                        doc = {
-                            "id": safe_hash_bytes(file_bytes),
-                            "name": f.name,
-                            "type": "pdf",
-                            "text": text,
-                            "pages": pages_read,
-                            "size_mb": len(file_bytes) / (1024 * 1024),
-                            "range": (start1, end1),
-                            "section": section_label,
-                        }
-                    else:
-                        # normal extraction (multi-files or non-pdf)
-                        doc = extract_text_any(f, tier=tier)
-
-                    text = doc["text"]
-                    if not text or len(text) < 60:
-                        raise ValueError("No readable text found. This may be a scanned PDF (image-based).")
-
-                    kws = extract_keywords(text, top_k=keyword_count)
-                    summary = summarize_sentences(text, n_sent=summary_sentences, user_type=user_type)
-
-                    sections = split_into_sections(text)
-
-                    doc_result = {
-                        "doc": doc,
-                        "text": text,
-                        "summary": summary,
-                        "keywords": kws,
-                        "sections": sections,
-                        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        "user_type": user_type,
-                    }
-                    results.append(doc_result)
-
-                except Exception as e:
-                    st.error(f"Failed on {f.name}: {e}")
-
-            if results:
-                st.session_state.last_result = results
-                for r in results:
-                    d = r["doc"]
-                    st.session_state.history.insert(0, {
-                        "name": d["name"],
-                        "created_at": r["created_at"],
-                        "summary": r["summary"],
-                        "keywords": r["keywords"],
-                        "size_mb": d.get("size_mb"),
-                        "pages": d.get("pages"),
-                        "range": d.get("range"),
-                        "section": d.get("section"),
-                        "user_type": r["user_type"],
-                    })
-                st.success("Done ✅")
-
-    # Show last results
-    last = st.session_state.last_result
-    if last:
-        st.divider()
-        st.subheader("Results")
-        for r in last:
-            d = r["doc"]
-            extra = ""
-            if d.get("range"):
-                extra += f" • Pages: {d['range'][0]}-{d['range'][1]}"
-            if d.get("section"):
-                extra += f" • Section: {d['section']}"
-            st.markdown(f"### {d['name']}")
-            st.caption(f"Type: {d['type']} • Size: {d.get('size_mb', 0):.1f}MB • Pages read: {d.get('pages','N/A')}{extra}")
-
-            col1, col2 = st.columns([1, 1])
-            with col1:
-                st.markdown("#### Summary")
-                st.write("\n".join([f"- {s}" for s in r["summary"]]) if r["summary"] else "No summary.")
-                st.markdown("#### Keywords")
-                st.write(", ".join(r["keywords"]) if r["keywords"] else "No keywords.")
-
-            with col2:
-                st.markdown("#### Highlights (inside original text)")
-                st.markdown(highlight_html(r["text"][:25000], r["keywords"]), unsafe_allow_html=True)
-                st.caption("Showing first ~25k characters for speed.")
-
-
-# -------------------------
-# Sections Tab
-# -------------------------
 def split_into_sections(text: str) -> List[Tuple[str, str]]:
-    """Line-based section splitter (headings/chapters)."""
-    lines = text.splitlines()
-    sections = []
+    lines = (text or "").splitlines()
+    sections: List[Tuple[str, str]] = []
     current_title = "Start"
-    buf = []
+    buf: List[str] = []
     for ln in lines:
         if looks_like_heading(ln):
             chunk = "\n".join(buf).strip()
@@ -811,192 +539,620 @@ def split_into_sections(text: str) -> List[Tuple[str, str]]:
     if final:
         sections.append((current_title, final))
     if len(sections) <= 1:
-        return [("Whole Document", text.strip())]
+        return [("Whole Document", (text or "").strip())]
     return sections
 
 
-with tabs[1]:
-    st.subheader("Section Splitter (choose a section to summarize)")
-    last = st.session_state.last_result
-    if not last:
-        st.info("Process a document first in the ✅ Process tab.")
-    else:
-        doc_names = [r["doc"]["name"] for r in last]
-        pick_doc = st.selectbox("Choose document", doc_names, key="sec_doc")
-        r = next(x for x in last if x["doc"]["name"] == pick_doc)
-        sections = r["sections"]
+# =========================
+# Export (PDF + DOCX)
+# =========================
+def export_pdf(title: str, summary: List[str], takeaways: List[str], questions: List[str]) -> bytes:
+    buf = io.BytesIO()
+    c = pdf_canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
+    x = 2.0 * cm
+    y = height - 2.0 * cm
 
-        titles = [f"{i+1}. {t}" for i, (t, _) in enumerate(sections)]
-        pick_title = st.selectbox("Choose section", titles, key="sec_pick")
-        idx = titles.index(pick_title)
-        sec_title, sec_text = sections[idx]
-
-        sec_kws = extract_keywords(sec_text, top_k=keyword_count)
-        sec_summary = summarize_sentences(sec_text, n_sent=summary_sentences, user_type=user_type)
-
-        left, right = st.columns([1, 1])
-        with left:
-            st.markdown(f"### {sec_title}")
-            st.markdown("#### Section Summary")
-            st.write("\n".join([f"- {s}" for s in sec_summary]) if sec_summary else "No summary.")
-            st.markdown("#### Section Keywords")
-            st.write(", ".join(sec_kws) if sec_kws else "No keywords.")
-        with right:
-            st.markdown("#### Highlighted Section Text")
-            st.markdown(highlight_html(sec_text[:50000], sec_kws), unsafe_allow_html=True)
-            st.caption("Showing first ~50k characters for speed.")
-
-
-# -------------------------
-# Glossary Tab
-# -------------------------
-with tabs[2]:
-    st.subheader("Glossary / Definitions (type a word and search)")
-    last = st.session_state.last_result
-    if not last:
-        st.info("Process a document first in the ✅ Process tab.")
-    else:
-        doc_names = [r["doc"]["name"] for r in last]
-        pick_doc = st.selectbox("Choose document for glossary", doc_names, key="gloss_doc")
-        r = next(x for x in last if x["doc"]["name"] == pick_doc)
-
-        query = st.text_input("Enter a word/term (e.g., 'cognition', 'liquidity sweep')", key="gloss_q")
-        if st.button("🔎 Search", key="gloss_btn"):
-            matches = glossary_define(query.strip(), r["text"], max_results=6)
-            if query.strip() and matches:
-                st.success(f"Found {len(matches)} relevant sentence(s):")
-                for m in matches:
-                    st.write(f"- {m}")
-            elif not query.strip():
-                st.warning("Type a word first.")
+    def draw_wrapped(txt: str, y: float, font="Helvetica", size=11, leading=14) -> float:
+        c.setFont(font, size)
+        max_w = width - 4.0 * cm
+        words = txt.split()
+        line = ""
+        for w in words:
+            test = (line + " " + w).strip()
+            if c.stringWidth(test, font, size) <= max_w:
+                line = test
             else:
-                st.warning("No definition found in this document. Try another term.")
+                c.drawString(x, y, line)
+                y -= leading
+                line = w
+                if y < 2.0 * cm:
+                    c.showPage()
+                    y = height - 2.0 * cm
+                    c.setFont(font, size)
+        if line:
+            c.drawString(x, y, line)
+            y -= leading
+        return y
+
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(x, y, title)
+    y -= 24
+
+    c.setFont("Helvetica", 10)
+    y = draw_wrapped(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", y, size=10)
+    y -= 8
+
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(x, y, "Summary")
+    y -= 18
+    for s in summary or ["(No summary)"]:
+        y = draw_wrapped(f"- {s}", y)
+
+    y -= 10
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(x, y, "Key Takeaways")
+    y -= 18
+    for i, t in enumerate(takeaways or ["(No takeaways)"], start=1):
+        y = draw_wrapped(f"{i}. {t}", y)
+
+    y -= 10
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(x, y, "Questions")
+    y -= 18
+    for i, q in enumerate(questions or ["(No questions)"], start=1):
+        y = draw_wrapped(f"{i}. {q}", y)
+
+    c.save()
+    buf.seek(0)
+    return buf.getvalue()
+
+def export_docx(title: str, summary: List[str], takeaways: List[str], questions: List[str]) -> bytes:
+    doc = DocxDocument()
+    doc.add_heading(title, level=1)
+    doc.add_paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    doc.add_heading("Summary", level=2)
+    for s in summary or ["(No summary)"]:
+        doc.add_paragraph(f"- {s}")
+    doc.add_heading("Key Takeaways", level=2)
+    for i, t in enumerate(takeaways or ["(No takeaways)"], start=1):
+        doc.add_paragraph(f"{i}. {t}")
+    doc.add_heading("Questions", level=2)
+    for i, q in enumerate(questions or ["(No questions)"], start=1):
+        doc.add_paragraph(f"{i}. {q}")
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
 
 
-# -------------------------
-# Flashcards Tab
-# -------------------------
-with tabs[3]:
-    st.subheader("Flashcards (MCQ + typed, auto-check)")
-    last = st.session_state.last_result
-    if not last:
-        st.info("Process a document first in the ✅ Process tab.")
+# =========================
+# Flashcards
+# =========================
+def make_flashcards(text: str, keywords: List[str], n_cards: int = 10) -> List[Dict[str, Any]]:
+    sents = [s for s in sentence_split(text) if len(s) >= 60]
+    if not sents:
+        sents = sentence_split(text)
+
+    pool = [k for k in (keywords or []) if 3 <= len(k) <= 35]
+    pool = list(dict.fromkeys(pool))
+
+    cards = []
+    used = set()
+
+    for sent in sents:
+        if len(cards) >= n_cards:
+            break
+        chosen = None
+        for k in pool:
+            if re.search(rf"(?i)\b{re.escape(k)}\b", sent):
+                chosen = k
+                break
+        if not chosen:
+            continue
+
+        key = (sent[:80] + chosen).lower()
+        if key in used:
+            continue
+        used.add(key)
+
+        blanked = re.sub(rf"(?i)\b{re.escape(chosen)}\b", "_____", sent, count=1)
+
+        # alternate typed and mcq
+        if len(cards) % 2 == 0:
+            cards.append({"type": "typed", "q": f"Fill in the missing term:\n\n{blanked}", "a": chosen})
+        else:
+            distractors = [x for x in pool if x.lower() != chosen.lower()]
+            distractors = distractors[:3] if len(distractors) >= 3 else distractors
+            options = [chosen] + distractors
+            options = list(dict.fromkeys(options))
+            cards.append({"type": "mcq", "q": f"Which term best completes the sentence?\n\n{blanked}", "a": chosen, "options": options})
+
+    return cards
+
+
+# =========================
+# Glossary (search word in text)
+# =========================
+def glossary_search(term: str, text: str, limit: int = 6) -> List[str]:
+    term = (term or "").strip()
+    if not term:
+        return []
+    sents = sentence_split(text)
+    hits = []
+    for s in sents:
+        if re.search(rf"(?i)\b{re.escape(term)}\b", s):
+            hits.append(s.strip())
+        if len(hits) >= limit:
+            break
+    return hits
+
+
+# =========================
+# Session State
+# =========================
+def init_state():
+    if "auth_ok" not in st.session_state:
+        st.session_state.auth_ok = False
+    if "auth_row" not in st.session_state:
+        st.session_state.auth_row = None
+    if "tier" not in st.session_state:
+        st.session_state.tier = FREE_TIER
+    if "docs_used" not in st.session_state:
+        st.session_state.docs_used = 0
+    if "history" not in st.session_state:
+        st.session_state.history = []
+    if "last_result" not in st.session_state:
+        st.session_state.last_result = None
+    if "cards" not in st.session_state:
+        st.session_state.cards = []
+    if "card_answers" not in st.session_state:
+        st.session_state.card_answers = {}
+
+init_state()
+
+
+# =========================
+# UI Header
+# =========================
+st.title(f"📄 {APP_NAME}")
+st.caption(APP_VERSION)
+
+
+# =========================
+# Sidebar: Login + Admin
+# =========================
+with st.sidebar:
+    st.subheader("🔐 Login (Unique PINs via Supabase)")
+    pin_input = st.text_input("Enter PIN", type="password", placeholder="XXXX-XXXX-XXXX")
+
+    if st.button("Unlock"):
+        ok, msg, row = verify_pin_and_bind(pin_input)
+        if ok:
+            st.session_state.auth_ok = True
+            st.session_state.auth_row = row
+            st.session_state.tier = tier_from_name(row["tier"])
+            st.success(msg)
+        else:
+            st.session_state.auth_ok = False
+            st.session_state.auth_row = None
+            st.error(msg)
+
+    if st.session_state.auth_ok:
+        st.success(f"Tier: {st.session_state.tier.name}")
+        st.write(f"Docs used (session): {st.session_state.docs_used}/{st.session_state.tier.max_docs}")
+        st.write(f"Max pages: {st.session_state.tier.max_pages}")
+        st.write(f"Max file size: {st.session_state.tier.max_mb}MB")
     else:
-        doc_names = [r["doc"]["name"] for r in last]
-        pick_doc = st.selectbox("Choose document for flashcards", doc_names, key="fc_doc")
-        r = next(x for x in last if x["doc"]["name"] == pick_doc)
+        st.warning("Locked. Enter a valid PIN.")
+        st.stop()
 
-        if st.button("🃏 Generate Flashcards", key="fc_gen"):
-            cards = make_flashcards(r["text"], keywords=r["keywords"], n_cards=flashcard_count)
-            st.session_state["cards"] = cards
-            st.session_state["card_answers"] = {}
-            st.success(f"Generated {len(cards)} flashcards!")
+    st.divider()
+    st.subheader("👑 Admin (Owner only)")
+    admin_pin = st.text_input("Admin PIN", type="password", help="This is only for generating/revoking pins.")
+    is_admin = bool(admin_pin) and (admin_pin == OWNER_ADMIN_PIN)
 
-        cards = st.session_state.get("cards", [])
-        if cards:
-            for i, c in enumerate(cards):
-                st.markdown(f"### Card {i+1}")
-                st.write(c["question"])
+    if is_admin:
+        st.success("Admin unlocked ✅")
 
-                if c["type"] == "mcq":
-                    choice = st.radio("Choose an answer", c["options"], key=f"mcq_{i}")
-                    st.session_state["card_answers"][i] = choice
-                else:
-                    typed = st.text_input("Type your answer", key=f"typed_{i}")
-                    st.session_state["card_answers"][i] = typed
+        gen_tier = st.selectbox("Generate tier", ["FREE", "PAID"], index=0)
+        max_devices = st.selectbox("Max devices", [1, 2, 3], index=0)
+        label = st.text_input("Label (e.g. 'friend varsity', 'order #123')")
+        expiry_days = st.number_input("Expiry days (0 = no expiry)", min_value=0, max_value=365, value=30, step=1)
 
-                st.divider()
+        if st.button("➕ Generate PIN"):
+            raw_pin = generate_pin()
+            payload = {
+                "pin_hash": hash_pin(raw_pin),
+                "tier": gen_tier,
+                "label": label.strip() if label else None,
+                "status": "ACTIVE",
+                "max_devices": int(max_devices),
+                "devices": [],
+            }
+            if int(expiry_days) > 0:
+                exp = datetime.now(timezone.utc) + timedelta(days=int(expiry_days))
+                payload["expires_at"] = exp.isoformat()
 
-            if st.button("✅ Check answers", key="fc_check"):
-                score = 0
-                for i, c in enumerate(cards):
-                    user_ans = (st.session_state["card_answers"].get(i) or "").strip()
-                    correct = c["answer"].strip()
-                    if c["type"] == "mcq":
-                        ok = user_ans.lower() == correct.lower()
-                    else:
-                        ok = correct.lower() in user_ans.lower() if len(correct) > 4 else user_ans.lower() == correct.lower()
+            sb().table("pins").insert(payload).execute()
+            st.code(raw_pin)  # show ONCE
 
-                    if ok:
-                        score += 1
-                        st.success(f"Card {i+1}: Correct ✅")
-                    else:
-                        st.error(f"Card {i+1}: Wrong ❌ | Correct: {correct}")
-                st.info(f"Score: {score}/{len(cards)}")
+        st.markdown("### 🔎 Search pins")
+        q = st.text_input("Search by label keyword", key="search_label")
+        if st.button("Search"):
+            data = sb().table("pins") \
+                .select("id,tier,label,status,max_devices,devices,created_at,expires_at") \
+                .ilike("label", f"%{q}%") \
+                .order("created_at", desc=True) \
+                .limit(50).execute().data
+            st.session_state.admin_search = data
 
-
-# -------------------------
-# Compare Tab
-# -------------------------
-with tabs[4]:
-    st.subheader("Multi-file Compare")
-    last = st.session_state.last_result
-    if not last or len(last) < 2:
-        st.info("Process at least 2 documents first in the ✅ Process tab.")
+        data = st.session_state.get("admin_search", [])
+        if data:
+            for row in data:
+                dev_count = len(row.get("devices") or [])
+                st.write(f"**#{row['id']}** • {row['tier']} • {row.get('label','-')} • {row['status']} • devices {dev_count}/{row['max_devices']}")
+                cols = st.columns(3)
+                if cols[0].button("Revoke", key=f"rev_{row['id']}"):
+                    sb().table("pins").update({"status": "REVOKED"}).eq("id", row["id"]).execute()
+                    st.warning("Revoked.")
+                if cols[1].button("Reset devices", key=f"rst_{row['id']}"):
+                    sb().table("pins").update({"devices": []}).eq("id", row["id"]).execute()
+                    st.info("Devices cleared.")
+                if cols[2].button("Details", key=f"det_{row['id']}"):
+                    st.json(row)
     else:
-        names = [r["doc"]["name"] for r in last]
-        a = st.selectbox("Document A", names, index=0, key="cmp_a")
-        b = st.selectbox("Document B", names, index=1, key="cmp_b")
+        st.caption("Admin tools locked.")
 
-        ra = next(x for x in last if x["doc"]["name"] == a)
-        rb = next(x for x in last if x["doc"]["name"] == b)
 
-        set_a = set([k.lower() for k in ra["keywords"]])
-        set_b = set([k.lower() for k in rb["keywords"]])
+# =========================
+# Main Settings
+# =========================
+tier = st.session_state.tier
 
-        overlap = sorted(set_a.intersection(set_b))
-        only_a = sorted(set_a - set_b)
-        only_b = sorted(set_b - set_a)
+left_settings, right_settings = st.columns([1, 1])
 
+with left_settings:
+    user_type = st.selectbox(
+        "Who are you?",
+        ["Varsity/College", "High school learner", "Primary learner", "Trader", "General"],
+        index=0
+    )
+
+with right_settings:
+    doc_mode = st.selectbox(
+        "Document type",
+        ["Notes/Book (PDF/DOCX/TXT)", "Slides (PDF only)"],
+        index=0,
+        help="Slides mode shows page-by-page highlights and is optimized for slide decks."
+    )
+
+summary_len = st.slider("Summary length (sentences)", 3, 12, 7)
+keyword_count = st.slider("Keywords to highlight", 5, 30, 12)
+question_count = st.slider("Questions to generate", 5, 25, 12)
+flashcard_count = st.slider("Flashcards to generate", 5, 25, 10)
+
+st.divider()
+
+# =========================
+# Upload (locked until PIN is valid)
+# =========================
+uploaded = st.file_uploader(
+    f"Upload a document (Tier {tier.name} • {tier.max_docs} docs/session • Max {tier.max_mb}MB)",
+    type=["pdf", "docx", "txt"],
+    accept_multiple_files=False
+)
+
+if not uploaded:
+    st.stop()
+
+if st.session_state.docs_used >= tier.max_docs:
+    st.error("You reached your document limit for this session.")
+    st.stop()
+
+file_bytes = uploaded.getvalue()
+if bytes_mb(file_bytes) > tier.max_mb:
+    st.error(f"File too large: {bytes_mb(file_bytes):.1f}MB. Limit {tier.max_mb}MB.")
+    st.stop()
+
+filename = uploaded.name
+ext = filename.lower().split(".")[-1]
+
+
+# =========================
+# PDF page range / section-only
+# =========================
+start_page, end_page = 1, 1
+pdf_sections: List[Tuple[str, int, int]] = []
+total_pages = None
+
+if ext == "pdf":
+    try:
+        total_pages = pdf_total_pages(file_bytes)
+    except Exception:
+        total_pages = 0
+
+    if total_pages <= 0:
+        st.error("Could not read this PDF (might be corrupted or scanned-image only).")
+        st.stop()
+
+    st.subheader("⚡ PDF Processing Options")
+    mode = st.radio(
+        "Choose processing mode",
+        ["Auto section (TOC → headings)", "Manual page range", "Full (limited by tier)"],
+        horizontal=True
+    )
+
+    if mode == "Full (limited by tier)":
+        start_page = 1
+        end_page = min(total_pages, tier.max_pages)
+        if total_pages > tier.max_pages:
+            st.warning(f"Tier limit: processing first {end_page} pages (out of {total_pages}).")
+
+    elif mode == "Manual page range":
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown("### Summary A")
-            st.write("\n".join([f"- {s}" for s in ra["summary"]]) if ra["summary"] else "No summary.")
+            start_page = st.number_input("Start page", min_value=1, max_value=total_pages, value=1, step=1)
         with c2:
-            st.markdown("### Summary B")
-            st.write("\n".join([f"- {s}" for s in rb["summary"]]) if rb["summary"] else "No summary.")
+            end_page = st.number_input("End page", min_value=1, max_value=total_pages, value=min(10, total_pages), step=1)
 
-        st.divider()
-        st.markdown("### Keyword Comparison")
-        k1, k2, k3 = st.columns(3)
-        with k1:
-            st.markdown("**Overlap**")
-            st.write(", ".join(overlap) if overlap else "None")
-        with k2:
-            st.markdown("**Only in A**")
-            st.write(", ".join(only_a[:30]) if only_a else "None")
-        with k3:
-            st.markdown("**Only in B**")
-            st.write(", ".join(only_b[:30]) if only_b else "None")
+        span = abs(int(end_page) - int(start_page)) + 1
+        if span > tier.max_pages:
+            st.error(f"Selected {span} pages, but your tier allows max {tier.max_pages}. Reduce the range.")
+            st.stop()
 
-
-# -------------------------
-# History Tab
-# -------------------------
-with tabs[5]:
-    st.subheader("Saved History (this session)")
-    hist = st.session_state.history
-    if not hist:
-        st.info("No history yet. Process a document first.")
     else:
-        for h in hist[:15]:
-            st.markdown(f"### {h['name']}")
-            sec = ""
-            if h.get("range"):
-                sec += f" • Pages: {h['range'][0]}-{h['range'][1]}"
-            if h.get("section"):
-                sec += f" • Section: {h['section']}"
-            st.caption(f"{h['created_at']} • User Type: {h.get('user_type','-')} • Size: {h.get('size_mb',0):.1f}MB{sec}")
-            st.write("\n".join([f"- {s}" for s in h["summary"]]) if h["summary"] else "No summary.")
-            st.write("Keywords: " + (", ".join(h["keywords"]) if h["keywords"] else "None"))
+        scan_pages = st.slider("If TOC is missing, scan headings in first N pages", 5, min(150, total_pages), 30)
+        toc = toc_sections(file_bytes)
+        if toc:
+            headings = toc
+            st.success("TOC found ✅")
+        else:
+            headings = scan_headings(file_bytes, scan_pages=scan_pages)
+            if headings:
+                st.info("TOC not found. Using scanned headings ✅")
+            else:
+                st.warning("No TOC/headings found. Use Manual page range or Full.")
+                headings = [("Whole Document", 0)]
+
+        pdf_ranges = heading_ranges(headings, total_pages)
+        labels = [f"{t} (pages {s}-{e})" for (t, s, e) in pdf_ranges]
+        pick = st.selectbox("Choose section", labels)
+        title, start_page, end_page = pdf_ranges[labels.index(pick)]
+
+        span = end_page - start_page + 1
+        if span > tier.max_pages:
+            st.warning(f"Section is {span} pages; trimming to tier max {tier.max_pages}.")
+            end_page = start_page + tier.max_pages - 1
+
+else:
+    mode = "Non-PDF"
+
+
+# =========================
+# Process Button
+# =========================
+if st.button("⚡ Process Now", type="primary"):
+    prog = st.progress(0, text="Starting...")
+
+    def progress_cb(done: int, total: int):
+        pct = int((done / max(1, total)) * 100)
+        prog.progress(pct, text=f"Extracting… {done}/{total}")
+
+    try:
+        if ext == "pdf":
+            text, per_page, pages_read = extract_pdf_range(file_bytes, int(start_page), int(end_page), progress_cb=progress_cb)
+        elif ext == "docx":
+            prog.progress(30, text="Reading DOCX…")
+            text = extract_docx_text(file_bytes)
+            per_page, pages_read = [], None
+            prog.progress(100, text="Done.")
+        else:
+            prog.progress(30, text="Reading TXT…")
+            text = extract_txt_text(file_bytes)
+            per_page, pages_read = [], None
+            prog.progress(100, text="Done.")
+
+        if not text or len(text) < 120:
+            prog.empty()
+            st.error("No readable text extracted. If this is a scanned PDF (image-only), OCR is needed (we can add later).")
+            st.stop()
+
+        # analysis
+        prog.progress(85, text="Analyzing…")
+        keywords = extract_keywords(text, top_k=keyword_count)
+        summary = summarize(text, n_sent=summary_len, user_type=user_type)
+        takeaways = key_takeaways(text, k=min(10, max(5, summary_len)))
+        questions = generate_questions(text, user_type=user_type, n=question_count)
+        sections_text = split_into_sections(text)
+
+        result = {
+            "name": filename,
+            "ext": ext,
+            "mode": mode,
+            "doc_mode": doc_mode,
+            "user_type": user_type,
+            "range": (int(start_page), int(end_page)) if ext == "pdf" else None,
+            "pages_read": pages_read,
+            "size_mb": bytes_mb(file_bytes),
+            "keywords": keywords,
+            "summary": summary,
+            "takeaways": takeaways,
+            "questions": questions,
+            "text": text,
+            "per_page": per_page if ext == "pdf" else [],
+            "sections": sections_text,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        st.session_state.last_result = result
+        st.session_state.history.insert(0, result)
+        st.session_state.docs_used += 1
+
+        prog.progress(100, text="Done ✅")
+        time.sleep(0.2)
+        prog.empty()
+
+    except Exception as e:
+        prog.empty()
+        st.error(f"Processing failed: {type(e).__name__}: {e}")
+        st.stop()
+
+
+# =========================
+# Show Results
+# =========================
+res = st.session_state.last_result
+if not res:
+    st.stop()
+
+st.subheader("✅ Results")
+meta = f"File: {res['name']} • Size: {res['size_mb']:.1f}MB • User type: {res['user_type']}"
+if res.get("range"):
+    meta += f" • Pages: {res['range'][0]}-{res['range'][1]}"
+st.caption(meta)
+
+tabs = st.tabs(["✅ Explanation", "🟣 Highlights", "❓ Questions", "📘 Glossary", "🃏 Flashcards", "🧩 Sections", "🆚 Compare", "🕘 History", "⬇️ Export"])
+
+with tabs[0]:
+    st.markdown("### Summary (readable)")
+    st.write("\n".join([f"- {s}" for s in res["summary"]]))
+
+    st.markdown("### Key Takeaways")
+    for t in res["takeaways"]:
+        st.markdown(f"- {t}")
+
+with tabs[1]:
+    st.markdown("### Keywords")
+    st.write(", ".join(res["keywords"]) if res["keywords"] else "(none)")
+
+    st.markdown("### Highlighted inside original text")
+    if res["doc_mode"].startswith("Slides") and res["ext"] == "pdf":
+        st.info("Slides mode: showing page-by-page highlights (faster + clearer for decks).")
+        per = res.get("per_page") or []
+        base_page = res["range"][0] if res.get("range") else 1
+        for i, ptxt in enumerate(per, start=base_page):
+            if not ptxt:
+                continue
+            st.markdown(f"#### Slide/Page {i}")
+            kws_slide = extract_keywords(ptxt, top_k=min(10, keyword_count))
+            st.markdown(highlight_html(ptxt, kws_slide, max_chars=25000), unsafe_allow_html=True)
+    else:
+        st.markdown(highlight_html(res["text"], res["keywords"]), unsafe_allow_html=True)
+
+with tabs[2]:
+    st.markdown("### Questions (non-repeating)")
+    for i, q in enumerate(res["questions"], start=1):
+        st.markdown(f"**{i}.** {q}")
+
+with tabs[3]:
+    st.markdown("### Glossary / Definitions")
+    term = st.text_input("Type a word/term to search in the document", key="gloss_term")
+    if st.button("Search term"):
+        hits = glossary_search(term, res["text"], limit=8)
+        if not hits:
+            st.warning("No matches found in this document.")
+        else:
+            for h in hits:
+                st.markdown(f"- {h}")
+
+with tabs[4]:
+    st.markdown("### Flashcards (practice mode)")
+    if st.button("Generate flashcards"):
+        st.session_state.cards = make_flashcards(res["text"], res["keywords"], n_cards=flashcard_count)
+        st.session_state.card_answers = {}
+        st.success(f"Generated {len(st.session_state.cards)} flashcards!")
+
+    cards = st.session_state.cards
+    if not cards:
+        st.info("Generate flashcards to start.")
+    else:
+        for idx, c in enumerate(cards):
+            st.markdown(f"#### Card {idx+1}")
+            st.write(c["q"])
+            if c["type"] == "mcq":
+                choice = st.radio("Choose", c["options"], key=f"mcq_{idx}")
+                st.session_state.card_answers[idx] = choice
+            else:
+                typed = st.text_input("Type your answer", key=f"typed_{idx}")
+                st.session_state.card_answers[idx] = typed
             st.divider()
 
-        export = {"exported_at": time.strftime("%Y-%m-%d %H:%M:%S"), "history": hist}
+        if st.button("Check answers"):
+            score = 0
+            for idx, c in enumerate(cards):
+                user_ans = (st.session_state.card_answers.get(idx) or "").strip()
+                correct = (c["a"] or "").strip()
+                ok = user_ans.lower() == correct.lower() if c["type"] == "mcq" else (correct.lower() in user_ans.lower())
+                if ok:
+                    score += 1
+                    st.success(f"Card {idx+1}: Correct ✅")
+                else:
+                    st.error(f"Card {idx+1}: Wrong ❌ (Correct: {correct})")
+            st.info(f"Score: {score}/{len(cards)}")
+
+with tabs[5]:
+    st.markdown("### Section Splitter (text-based)")
+    sections = res.get("sections") or [("Whole Document", res["text"])]
+    titles = [f"{i+1}. {t}" for i, (t, _) in enumerate(sections)]
+    pick = st.selectbox("Choose a section", titles)
+    idx = titles.index(pick)
+    title, sec_text = sections[idx]
+
+    st.markdown(f"#### {title}")
+    sec_kws = extract_keywords(sec_text, top_k=min(12, keyword_count))
+    sec_sum = summarize(sec_text, n_sent=min(summary_len, 8), user_type=res["user_type"])
+    st.write("\n".join([f"- {s}" for s in sec_sum]) if sec_sum else "No summary.")
+    st.markdown(highlight_html(sec_text, sec_kws, max_chars=60000), unsafe_allow_html=True)
+
+with tabs[6]:
+    st.markdown("### Compare (last two processed docs this session)")
+    if len(st.session_state.history) < 2:
+        st.info("Process at least 2 docs to compare.")
+    else:
+        a = st.session_state.history[0]
+        b = st.session_state.history[1]
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown(f"#### A: {a['name']}")
+            st.write("\n".join([f"- {s}" for s in a["summary"]]))
+        with c2:
+            st.markdown(f"#### B: {b['name']}")
+            st.write("\n".join([f"- {s}" for s in b["summary"]]))
+
+        common = sorted(set([k.lower() for k in a["keywords"]]) & set([k.lower() for k in b["keywords"]]))
+        st.markdown("#### Common keywords")
+        st.write(", ".join(common) if common else "(none)")
+
+with tabs[7]:
+    st.markdown("### History (this session)")
+    if not st.session_state.history:
+        st.info("No history yet.")
+    else:
+        for h in st.session_state.history[:10]:
+            meta = f"{h['created_at']} • {h['user_type']} • {h['size_mb']:.1f}MB"
+            if h.get("range"):
+                meta += f" • pages {h['range'][0]}-{h['range'][1]}"
+            st.markdown(f"**{h['name']}**")
+            st.caption(meta)
+            st.write(", ".join(h["keywords"][:12]) if h.get("keywords") else "")
+            st.divider()
+
+        export = {"exported_at": datetime.now().isoformat(timespec="seconds"), "history": st.session_state.history}
         st.download_button(
             "⬇️ Download History (JSON)",
             data=json.dumps(export, indent=2),
-            file_name="docsum_history.json",
+            file_name="doculite_history.json",
             mime="application/json"
         )
 
-st.caption("Note: Scanned PDFs (image-only) need OCR to extract text (we can add OCR later).")
+with tabs[8]:
+    st.markdown("### Export Summary + Questions")
+    pdf_bytes = export_pdf(APP_NAME, res["summary"], res["takeaways"], res["questions"])
+    docx_bytes = export_docx(APP_NAME, res["summary"], res["takeaways"], res["questions"])
+
+    st.download_button("⬇️ Download PDF", data=pdf_bytes, file_name="doculite_export.pdf", mime="application/pdf")
+    st.download_button("⬇️ Download Word (DOCX)", data=docx_bytes, file_name="doculite_export.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
+st.caption("Note: scanned/image PDFs need OCR to extract text. We can add OCR later (it costs CPU/time).")
